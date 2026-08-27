@@ -1,0 +1,35 @@
+                          onClick={() => {
+                            const whatsappNumber = item.phone.replace(/\D/g, '');
+                            const countryCode = settings.whatsappCountryCode?.replace(/\D/g, '') || '1';
+                            const message = `Hi, ${item.customerName.split(' ')[0]}! ✨\n\nThis is the team from ${settings.brandName || 'Easy Beauty'}. Just reminding you that your ${item.procedure} appointment was ${item.maintenanceDays} days ago on ${item.expiryDate.toLocaleDateString('en-US')}. Shall we schedule your return?`;
+                            const url = `https://wa.me/${whatsappNumber.startsWith(countryCode) ? '' : countryCode}${whatsappNumber}?text=${encodeURIComponent(message)}`;
+                            window.open(url, '_blank');
+                          }}
+                          className="flex-1 flex items-center justify-center gap-2 px-6 py-3 bg-green-500 text-white rounded-xl font-bold hover:bg-green-600 transition-all shadow-md active:scale-95"
+                          title="WhatsApp"
+                        >
+                          <MessageCircle size={18} fill="currentColor" /> WHATSAPP
+--
+                          }
+                          
+                          const whatsappNumber = isAttendingOrder.phone.replace(/\D/g, '');
+                          const countryCode = settings.whatsappCountryCode?.replace(/\D/g, '') || '1';
+                          const url = `https://wa.me/${whatsappNumber.startsWith(countryCode) ? '' : countryCode}${whatsappNumber}?text=${encodeURIComponent("*Post-Service Instructions:*\n\n" + postInstructions)}`;
+                          window.open(url, '_blank');
+                        }}
+                        className="py-3 rounded-2xl border-2 flex items-center justify-center gap-2 font-bold shadow-sm active:scale-95 transition-all outline-none"
+                        style={{ color: settings.primaryColor, borderColor: settings.primaryColor + '20' }}
+                      >
+                        <MessageSquare size={18} /> WHATSAPP
+--
+                            
+                            const countryCode = settings.whatsappCountryCode?.replace(/\D/g, '') || '1';
+                            let whatsappNumber = isAttendingOrder.phone.replace(/\D/g, '');
+                            
+                            const url = `https://wa.me/${whatsappNumber.startsWith(countryCode) ? '' : countryCode}${whatsappNumber}?text=${encodeURIComponent(message)}`;
+                            window.open(url, '_blank');
+                            
+                            setIsAttendingOrder(null);
+                            setAttendingStep(1);
+                            setShowGiftVoucher(false);
+                            toast.success('Service finalized successfully!');
