@@ -1343,6 +1343,9 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     if (isSaving) return;
     setIsSaving(true);
     try {
+      if (!auth.currentUser) {
+        await signInAnonymously(auth);
+      }
       // Remover campos undefined que podem dar erro no Firestore
       const cleanSettings = JSON.parse(JSON.stringify(settings));
       await setDoc(doc(db, 'configuracoes', 'geral'), cleanSettings);
@@ -1393,13 +1396,20 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
           businessDescription: settings.businessDescription,
           analysis: response.text
         };
+        if (!auth.currentUser) {
+          await signInAnonymously(auth);
+        }
+        const newHistory = [newReport, ...(settings.seoHistory || [])];
         const newSettings = { 
           ...settings, 
           seoAnalysis: response.text, 
-          seoHistory: [newReport, ...(settings.seoHistory || [])]
+          seoHistory: newHistory
         };
+        await setDoc(doc(db, 'configuracoes', 'geral'), JSON.parse(JSON.stringify({
+          seoAnalysis: response.text,
+          seoHistory: newHistory
+        })), { merge: true });
         setSettings(newSettings);
-        await setDoc(doc(db, 'configuracoes', 'geral'), newSettings);
         toast.success('SEO report generated successfully!');
       }
     } catch (error) {
@@ -1412,16 +1422,23 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
 
   const deleteSEOReport = async (reportId: string) => {
     const newHistory = settings.seoHistory?.filter(r => r.id !== reportId) || [];
+    const newSeoAnalysis = settings.seoHistory?.find(r => r.id === reportId)?.analysis === settings.seoAnalysis 
+      ? (newHistory[0]?.analysis || '') 
+      : settings.seoAnalysis;
     const newSettings = { 
       ...settings, 
       seoHistory: newHistory,
       // If deleting the current active analysis, set to most recent or empty
-      seoAnalysis: settings.seoHistory?.find(r => r.id === reportId)?.analysis === settings.seoAnalysis 
-        ? (newHistory[0]?.analysis || '') 
-        : settings.seoAnalysis
+      seoAnalysis: newSeoAnalysis
     };
+    if (!auth.currentUser) {
+      await signInAnonymously(auth);
+    }
+    await setDoc(doc(db, 'configuracoes', 'geral'), JSON.parse(JSON.stringify({
+      seoHistory: newHistory,
+      seoAnalysis: newSeoAnalysis || ''
+    })), { merge: true });
     setSettings(newSettings);
-    await setDoc(doc(db, 'configuracoes', 'geral'), newSettings);
     toast.success('Report deleted.');
   };
 
@@ -3651,13 +3668,16 @@ Can we confirm your visit? ✨`;
                       toast.error(settings.language === 'pt' ? 'Por favor preencha a data e selecione pelo menos um setor' : 'Please fill the date and select at least one department');
                       return;
                     }
+                    if (!auth.currentUser) {
+                      await signInAnonymously(auth);
+                    }
                     const hObj: Holiday = { date: newHolidayDate, departments: newHolidayDepts };
                     const currentHolidays = settings.holidays || [];
-                    const newHolidays = [...currentHolidays, hObj];
-                    const newSettings = { ...settings, holidays: newHolidays };
-                    setSettings(newSettings);
+                    const cleanHolidays = JSON.parse(JSON.stringify([...currentHolidays, hObj]));
+                    const newSettings = { ...settings, holidays: cleanHolidays };
                     
-                    await setDoc(doc(db, 'configuracoes', 'geral'), JSON.parse(JSON.stringify(newSettings)));
+                    await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
+                    setSettings(newSettings);
                     
                     setNewHolidayDate('');
                     setNewHolidayDepts(['all']);
@@ -3736,11 +3756,15 @@ Can we confirm your visit? ✨`;
                             : 'Are you sure you want to permanently delete this closure/holiday?',
                           onConfirm: async () => {
                             try {
+                              if (!auth.currentUser) {
+                                await signInAnonymously(auth);
+                              }
                               const newHolidays = settings.holidays?.filter((_, i) => i !== idx) || [];
-                              const newSettings = { ...settings, holidays: newHolidays };
-                              setSettings(newSettings);
+                              const cleanHolidays = JSON.parse(JSON.stringify(newHolidays));
+                              const newSettings = { ...settings, holidays: cleanHolidays };
                               
-                              await setDoc(doc(db, 'configuracoes', 'geral'), JSON.parse(JSON.stringify(newSettings)));
+                              await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
+                              setSettings(newSettings);
                               
                               setConfirmModal(prev => ({ ...prev, isOpen: false }));
                               toast.success(settings.language === 'pt' ? 'Bloqueio removido e salvo com sucesso!' : 'Closure removed and saved successfully!');
@@ -8384,6 +8408,9 @@ Can we confirm your visit? ✨`;
                         message: msg,
                         onConfirm: async () => {
                           try {
+                            if (!auth.currentUser) {
+                              await signInAnonymously(auth);
+                            }
                             const currentHolidays = settings.holidays || [];
                             const newHolidays = currentHolidays.filter((h: any) => {
                               if (typeof h === 'string') return true;
@@ -8395,15 +8422,16 @@ Can we confirm your visit? ✨`;
                               return !isMatch;
                             });
 
-                            const newSettings = { ...settings, holidays: newHolidays };
+                            const cleanHolidays = JSON.parse(JSON.stringify(newHolidays));
+                            const newSettings = { ...settings, holidays: cleanHolidays };
+                            await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
                             setSettings(newSettings);
-                            await setDoc(doc(db, 'configuracoes', 'geral'), newSettings);
                             toast.success(settings.language === 'pt' ? 'Bloqueio removido com sucesso!' : 'Block removed successfully!');
                             setSelectedBlockDetail(null);
                             setConfirmModal(prev => ({ ...prev, isOpen: false }));
-                          } catch (err) {
+                          } catch (err: any) {
                             console.error("Error removing block:", err);
-                            toast.error(settings.language === 'pt' ? 'Erro ao remover' : 'Error removing');
+                            toast.error(`${settings.language === 'pt' ? 'Erro ao remover' : 'Error removing'}${err?.message ? `: ${err.message}` : ''}`);
                           }
                         }
                       });
@@ -8564,15 +8592,19 @@ Can we confirm your visit? ✨`;
                     }
 
                     try {
+                      if (!auth.currentUser) {
+                        await signInAnonymously(auth);
+                      }
                       const currentHolidays = settings.holidays || [];
-                      const newSettings = { ...settings, holidays: [...currentHolidays, hObj] };
+                      const cleanHolidays = JSON.parse(JSON.stringify([...currentHolidays, hObj]));
+                      const newSettings = { ...settings, holidays: cleanHolidays };
+                      await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
                       setSettings(newSettings);
-                      await setDoc(doc(db, 'configuracoes', 'geral'), newSettings);
                       toast.success('Period blocked successfully!');
                       setIsBlockingModalOpen(false);
-                    } catch (err) {
+                    } catch (err: any) {
                       console.error("Error creating block:", err);
-                      toast.error('Error blocking period');
+                      toast.error(`Error blocking period${err?.message ? `: ${err.message}` : ''}`);
                     }
                   }}
                   className="flex-[2] py-3 rounded-xl font-bold text-xs uppercase text-white bg-red-600 hover:bg-red-700 transition-all shadow-lg active:scale-95"
