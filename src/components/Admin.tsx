@@ -4,7 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { 
   collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc, deleteField,
-  query, orderBy, serverTimestamp, getDocs 
+  query, orderBy, serverTimestamp, getDocs, getDoc 
 } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
 import { Product, Order, Settings, Category, Side, CustomerRecord, Holiday, AnamneseForm, AnamneseQuestion, Professional, BlacklistRecord, WorkingHours, DaySchedule } from '../types';
@@ -1339,11 +1339,48 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     }
   };
 
-  const saveHolidaysToFirestore = async (nextHolidays: (string | Holiday)[]) => {
+  const mergeUniqueHolidaysList = (
+    ...lists: ((string | Holiday)[] | undefined)[]
+  ): (string | Holiday)[] => {
+    const seen = new Set<string>();
+    const result: (string | Holiday)[] = [];
+    for (const list of lists) {
+      if (!Array.isArray(list)) continue;
+      for (const item of list) {
+        if (!item) continue;
+        const key = typeof item === 'string'
+          ? `str:${item}`
+          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(item.departments || []).join(',')}|${item.notes || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          result.push(item);
+        }
+      }
+    }
+    return result;
+  };
+
+  const saveHolidaysToFirestore = async (nextHolidays: (string | Holiday)[], isDeletion: boolean = false) => {
     if (!auth.currentUser) {
       await signInAnonymously(auth);
     }
-    const cleanHolidays = JSON.parse(JSON.stringify(nextHolidays));
+
+    let finalList = nextHolidays;
+    if (!isDeletion) {
+      try {
+        const [bloqueiosSnap, geralSnap] = await Promise.all([
+          getDoc(doc(db, 'configuracoes', 'bloqueios')),
+          getDoc(doc(db, 'configuracoes', 'geral')),
+        ]);
+        const existingBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
+        const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
+        finalList = mergeUniqueHolidaysList(existingGeral, existingBloqueios, nextHolidays);
+      } catch (fetchErr) {
+        console.warn('Could not fetch latest holidays before merge, using local list:', fetchErr);
+      }
+    }
+
+    const cleanHolidays = JSON.parse(JSON.stringify(finalList));
     await setDoc(doc(db, 'configuracoes', 'bloqueios'), {
       holidays: cleanHolidays,
       migrated: true,
@@ -1467,7 +1504,19 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         seoHistory: seoHistory || [],
         migrated: true,
       }));
-      const cleanHolidays = JSON.parse(JSON.stringify(holidays || []));
+      let mergedHolidays = holidays || [];
+      try {
+        const [bloqueiosSnap, geralSnap] = await Promise.all([
+          getDoc(doc(db, 'configuracoes', 'bloqueios')),
+          getDoc(doc(db, 'configuracoes', 'geral')),
+        ]);
+        const existingBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
+        const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
+        mergedHolidays = mergeUniqueHolidaysList(existingGeral, existingBloqueios, holidays || []);
+      } catch (fetchErr) {
+        console.warn('Could not merge holidays during saveSettings:', fetchErr);
+      }
+      const cleanHolidays = JSON.parse(JSON.stringify(mergedHolidays));
 
       await Promise.all([
         setDoc(doc(db, 'configuracoes', 'midia'), cleanMidia),
@@ -3897,7 +3946,7 @@ Can we confirm your visit? ✨`;
                           onConfirm: async () => {
                             try {
                               const newHolidays = settings.holidays?.filter((_, i) => i !== idx) || [];
-                              await saveHolidaysToFirestore(newHolidays);
+                              await saveHolidaysToFirestore(newHolidays, true);
                               
                               setConfirmModal(prev => ({ ...prev, isOpen: false }));
                               toast.success(settings.language === 'pt' ? 'Bloqueio removido e salvo com sucesso!' : 'Closure removed and saved successfully!');
@@ -8552,7 +8601,7 @@ Can we confirm your visit? ✨`;
                               return !isMatch;
                             });
 
-                            await saveHolidaysToFirestore(newHolidays);
+                            await saveHolidaysToFirestore(newHolidays, true);
                             toast.success(settings.language === 'pt' ? 'Bloqueio removido com sucesso!' : 'Block removed successfully!');
                             setSelectedBlockDetail(null);
                             setConfirmModal(prev => ({ ...prev, isOpen: false }));

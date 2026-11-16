@@ -75,6 +75,27 @@ export default function App() {
     let fundoData: { backgroundImage?: string; migrated?: boolean } | null = null;
     let pagamentosData: (Partial<Settings> & { migrated?: boolean }) | null = null;
 
+    const mergeUniqueHolidays = (
+      listA: (string | Holiday)[] = [],
+      listB: (string | Holiday)[] = []
+    ): (string | Holiday)[] => {
+      const seen = new Set<string>();
+      const result: (string | Holiday)[] = [];
+      const addItem = (item: string | Holiday) => {
+        if (!item) return;
+        const key = typeof item === 'string'
+          ? `str:${item}`
+          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(item.departments || []).join(',')}|${item.notes || ''}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          result.push(item);
+        }
+      };
+      listA.forEach(addItem);
+      listB.forEach(addItem);
+      return result;
+    };
+
     const applyMergedSettings = () => {
       if (!geralData) return;
 
@@ -104,9 +125,10 @@ export default function App() {
           seoAnalysis: seoData.seoAnalysis ?? '',
           seoHistory: seoData.seoHistory ?? [],
         } : {}),
-        holidays: bloqueiosData?.migrated
-          ? (bloqueiosData.holidays || [])
-          : (geralData.holidays || []),
+        holidays: mergeUniqueHolidays(
+          geralData.holidays || [],
+          bloqueiosData?.holidays || []
+        ),
       };
 
       setSettings(merged);
