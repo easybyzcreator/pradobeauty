@@ -3,7 +3,7 @@ import { db, auth } from '../firebase';
 import { GoogleGenAI } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { 
-  collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc, 
+  collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc, deleteField,
   query, orderBy, serverTimestamp, getDocs 
 } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
@@ -1314,8 +1314,8 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
           const canvas = document.createElement('canvas');
           let width = img.width;
           let height = img.height;
-          const MAX_WIDTH = isGallery ? 800 : 1200;
-          const MAX_HEIGHT = isGallery ? 800 : 1200;
+          const MAX_WIDTH = isGallery ? 700 : 900;
+          const MAX_HEIGHT = isGallery ? 700 : 900;
           if (width > height) {
             if (width > MAX_WIDTH) {
               height *= MAX_WIDTH / width;
@@ -1331,12 +1331,61 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
           canvas.height = height;
           const ctx = canvas.getContext('2d');
           ctx?.drawImage(img, 0, 0, width, height);
-          const compressedBase64 = canvas.toDataURL('image/jpeg', isGallery ? 0.5 : 0.7);
+          const compressedBase64 = canvas.toDataURL('image/jpeg', isGallery ? 0.5 : 0.6);
           callback(compressedBase64);
         };
       };
       reader.readAsDataURL(file);
     }
+  };
+
+  const saveHolidaysToFirestore = async (nextHolidays: (string | Holiday)[]) => {
+    if (!auth.currentUser) {
+      await signInAnonymously(auth);
+    }
+    const cleanHolidays = JSON.parse(JSON.stringify(nextHolidays));
+    await setDoc(doc(db, 'configuracoes', 'bloqueios'), {
+      holidays: cleanHolidays,
+      migrated: true,
+    });
+    try {
+      await updateDoc(doc(db, 'configuracoes', 'geral'), {
+        holidays: deleteField(),
+      });
+    } catch (cleanupErr) {
+      console.warn('Could not clean legacy holidays from geral:', cleanupErr);
+    }
+    setSettings(prev => ({ ...prev, holidays: cleanHolidays }));
+  };
+
+  const compressDataUrlIfLarge = (value?: string, maxDim: number = 700, quality: number = 0.6): Promise<string | undefined> => {
+    if (!value || !value.startsWith('data:image/') || value.length < 180_000) {
+      return Promise.resolve(value);
+    }
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+        if (width > height) {
+          if (width > maxDim) {
+            height *= maxDim / width;
+            width = maxDim;
+          }
+        } else if (height > maxDim) {
+          width *= maxDim / height;
+          height = maxDim;
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => resolve(value);
+      img.src = value;
+    });
   };
 
   const saveSettings = async () => {
@@ -1346,9 +1395,89 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       if (!auth.currentUser) {
         await signInAnonymously(auth);
       }
-      // Remover campos undefined que podem dar erro no Firestore
-      const cleanSettings = JSON.parse(JSON.stringify(settings));
-      await setDoc(doc(db, 'configuracoes', 'geral'), cleanSettings);
+
+      const {
+        holidays,
+        seoAnalysis,
+        seoHistory,
+        logo,
+        backgroundImage,
+        hairIcon,
+        makeupIcon,
+        nailsIcon,
+        spaIcon,
+        clinicIcon,
+        aestheticIcon,
+        zelleQR,
+        venmoQR,
+        paypalQR,
+        debitCardQR,
+        creditCardQR,
+        pixQR,
+        ...coreSettings
+      } = settings;
+
+      const [
+        cLogo, cHairIcon, cMakeupIcon, cNailsIcon, cSpaIcon, cClinicIcon, cAestheticIcon,
+        cBg,
+        cZelle, cVenmo, cPaypal, cDebit, cCredit, cPix
+      ] = await Promise.all([
+        compressDataUrlIfLarge(logo, 600, 0.65),
+        compressDataUrlIfLarge(hairIcon, 500, 0.6),
+        compressDataUrlIfLarge(makeupIcon, 500, 0.6),
+        compressDataUrlIfLarge(nailsIcon, 500, 0.6),
+        compressDataUrlIfLarge(spaIcon, 500, 0.6),
+        compressDataUrlIfLarge(clinicIcon, 500, 0.6),
+        compressDataUrlIfLarge(aestheticIcon, 500, 0.6),
+        compressDataUrlIfLarge(backgroundImage, 900, 0.6),
+        compressDataUrlIfLarge(zelleQR, 500, 0.65),
+        compressDataUrlIfLarge(venmoQR, 500, 0.65),
+        compressDataUrlIfLarge(paypalQR, 500, 0.65),
+        compressDataUrlIfLarge(debitCardQR, 500, 0.65),
+        compressDataUrlIfLarge(creditCardQR, 500, 0.65),
+        compressDataUrlIfLarge(pixQR, 500, 0.65),
+      ]);
+
+      const cleanCore = JSON.parse(JSON.stringify(coreSettings));
+      const cleanMidia = JSON.parse(JSON.stringify({
+        logo: cLogo,
+        hairIcon: cHairIcon,
+        makeupIcon: cMakeupIcon,
+        nailsIcon: cNailsIcon,
+        spaIcon: cSpaIcon,
+        clinicIcon: cClinicIcon,
+        aestheticIcon: cAestheticIcon,
+        migrated: true,
+      }));
+      const cleanFundo = JSON.parse(JSON.stringify({
+        backgroundImage: cBg,
+        migrated: true,
+      }));
+      const cleanPagamentos = JSON.parse(JSON.stringify({
+        zelleQR: cZelle,
+        venmoQR: cVenmo,
+        paypalQR: cPaypal,
+        debitCardQR: cDebit,
+        creditCardQR: cCredit,
+        pixQR: cPix,
+        migrated: true,
+      }));
+      const cleanSeo = JSON.parse(JSON.stringify({
+        seoAnalysis: seoAnalysis || '',
+        seoHistory: seoHistory || [],
+        migrated: true,
+      }));
+      const cleanHolidays = JSON.parse(JSON.stringify(holidays || []));
+
+      await Promise.all([
+        setDoc(doc(db, 'configuracoes', 'midia'), cleanMidia),
+        setDoc(doc(db, 'configuracoes', 'fundo'), cleanFundo),
+        setDoc(doc(db, 'configuracoes', 'pagamentos'), cleanPagamentos),
+        setDoc(doc(db, 'configuracoes', 'seo'), cleanSeo),
+        setDoc(doc(db, 'configuracoes', 'bloqueios'), { holidays: cleanHolidays, migrated: true }),
+      ]);
+
+      await setDoc(doc(db, 'configuracoes', 'geral'), cleanCore);
       toast.success('Settings saved successfully!');
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 3000);
@@ -1405,10 +1534,19 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
           seoAnalysis: response.text, 
           seoHistory: newHistory
         };
-        await setDoc(doc(db, 'configuracoes', 'geral'), JSON.parse(JSON.stringify({
+        await setDoc(doc(db, 'configuracoes', 'seo'), JSON.parse(JSON.stringify({
           seoAnalysis: response.text,
-          seoHistory: newHistory
-        })), { merge: true });
+          seoHistory: newHistory,
+          migrated: true,
+        })));
+        try {
+          await updateDoc(doc(db, 'configuracoes', 'geral'), {
+            seoAnalysis: deleteField(),
+            seoHistory: deleteField(),
+          });
+        } catch (cleanupErr) {
+          console.warn('Could not clean legacy seo from geral:', cleanupErr);
+        }
         setSettings(newSettings);
         toast.success('SEO report generated successfully!');
       }
@@ -1434,10 +1572,19 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     if (!auth.currentUser) {
       await signInAnonymously(auth);
     }
-    await setDoc(doc(db, 'configuracoes', 'geral'), JSON.parse(JSON.stringify({
+    await setDoc(doc(db, 'configuracoes', 'seo'), JSON.parse(JSON.stringify({
       seoHistory: newHistory,
-      seoAnalysis: newSeoAnalysis || ''
-    })), { merge: true });
+      seoAnalysis: newSeoAnalysis || '',
+      migrated: true,
+    })));
+    try {
+      await updateDoc(doc(db, 'configuracoes', 'geral'), {
+        seoAnalysis: deleteField(),
+        seoHistory: deleteField(),
+      });
+    } catch (cleanupErr) {
+      console.warn('Could not clean legacy seo from geral:', cleanupErr);
+    }
     setSettings(newSettings);
     toast.success('Report deleted.');
   };
@@ -3668,23 +3815,16 @@ Can we confirm your visit? ✨`;
                       toast.error(settings.language === 'pt' ? 'Por favor preencha a data e selecione pelo menos um setor' : 'Please fill the date and select at least one department');
                       return;
                     }
-                    if (!auth.currentUser) {
-                      await signInAnonymously(auth);
-                    }
                     const hObj: Holiday = { date: newHolidayDate, departments: newHolidayDepts };
                     const currentHolidays = settings.holidays || [];
-                    const cleanHolidays = JSON.parse(JSON.stringify([...currentHolidays, hObj]));
-                    const newSettings = { ...settings, holidays: cleanHolidays };
-                    
-                    await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
-                    setSettings(newSettings);
+                    await saveHolidaysToFirestore([...currentHolidays, hObj]);
                     
                     setNewHolidayDate('');
                     setNewHolidayDepts(['all']);
                     toast.success(settings.language === 'pt' ? 'Bloqueio adicionado e salvo com sucesso!' : 'Closure added and saved successfully!');
-                  } catch (err) {
+                  } catch (err: any) {
                     console.error(err);
-                    toast.error(settings.language === 'pt' ? 'Erro ao salvar o bloqueio.' : 'Error saving the closure.');
+                    toast.error(`${settings.language === 'pt' ? 'Erro ao salvar o bloqueio.' : 'Error saving the closure.'}${err?.message ? ` (${err.message})` : ''}`);
                   }
                 }}
                 className="w-full py-4 rounded-xl font-bold shadow-xl" 
@@ -3756,21 +3896,14 @@ Can we confirm your visit? ✨`;
                             : 'Are you sure you want to permanently delete this closure/holiday?',
                           onConfirm: async () => {
                             try {
-                              if (!auth.currentUser) {
-                                await signInAnonymously(auth);
-                              }
                               const newHolidays = settings.holidays?.filter((_, i) => i !== idx) || [];
-                              const cleanHolidays = JSON.parse(JSON.stringify(newHolidays));
-                              const newSettings = { ...settings, holidays: cleanHolidays };
-                              
-                              await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
-                              setSettings(newSettings);
+                              await saveHolidaysToFirestore(newHolidays);
                               
                               setConfirmModal(prev => ({ ...prev, isOpen: false }));
                               toast.success(settings.language === 'pt' ? 'Bloqueio removido e salvo com sucesso!' : 'Closure removed and saved successfully!');
-                            } catch (err) {
+                            } catch (err: any) {
                               console.error(err);
-                              toast.error(settings.language === 'pt' ? 'Erro ao salvar alterações.' : 'Error saving changes.');
+                              toast.error(`${settings.language === 'pt' ? 'Erro ao salvar alterações.' : 'Error saving changes.'}${err?.message ? ` (${err.message})` : ''}`);
                             }
                           }
                         });
@@ -8408,9 +8541,6 @@ Can we confirm your visit? ✨`;
                         message: msg,
                         onConfirm: async () => {
                           try {
-                            if (!auth.currentUser) {
-                              await signInAnonymously(auth);
-                            }
                             const currentHolidays = settings.holidays || [];
                             const newHolidays = currentHolidays.filter((h: any) => {
                               if (typeof h === 'string') return true;
@@ -8422,10 +8552,7 @@ Can we confirm your visit? ✨`;
                               return !isMatch;
                             });
 
-                            const cleanHolidays = JSON.parse(JSON.stringify(newHolidays));
-                            const newSettings = { ...settings, holidays: cleanHolidays };
-                            await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
-                            setSettings(newSettings);
+                            await saveHolidaysToFirestore(newHolidays);
                             toast.success(settings.language === 'pt' ? 'Bloqueio removido com sucesso!' : 'Block removed successfully!');
                             setSelectedBlockDetail(null);
                             setConfirmModal(prev => ({ ...prev, isOpen: false }));
@@ -8592,14 +8719,8 @@ Can we confirm your visit? ✨`;
                     }
 
                     try {
-                      if (!auth.currentUser) {
-                        await signInAnonymously(auth);
-                      }
                       const currentHolidays = settings.holidays || [];
-                      const cleanHolidays = JSON.parse(JSON.stringify([...currentHolidays, hObj]));
-                      const newSettings = { ...settings, holidays: cleanHolidays };
-                      await setDoc(doc(db, 'configuracoes', 'geral'), { holidays: cleanHolidays }, { merge: true });
-                      setSettings(newSettings);
+                      await saveHolidaysToFirestore([...currentHolidays, hObj]);
                       toast.success('Period blocked successfully!');
                       setIsBlockingModalOpen(false);
                     } catch (err: any) {

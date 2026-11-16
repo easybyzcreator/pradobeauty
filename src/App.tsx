@@ -4,7 +4,7 @@ import Admin from './components/Admin';
 import Footer from './components/Footer';
 import { db } from './firebase';
 import { doc, onSnapshot, setDoc, getDocs, collection, query, where, addDoc, serverTimestamp } from 'firebase/firestore';
-import { Settings } from './types';
+import { Settings, Holiday } from './types';
 import { Toaster, toast } from 'sonner';
 
 import { DEFAULT_LOGO, DEFAULT_BACKGROUND, INITIAL_PRODUCTS, INITIAL_CATEGORIES } from './constants';
@@ -65,11 +65,72 @@ export default function App() {
 
     // Timeout de 10 segundos para o loading
     const loadingTimeout = setTimeout(() => {
-      if (loading) {
-        console.warn("Loading timeout: Firebase connection taking too long.");
-        setLoading(false);
-      }
+      setLoading(false);
     }, 10000);
+
+    let geralData: Partial<Settings> | null = null;
+    let bloqueiosData: { holidays?: (string | Holiday)[]; migrated?: boolean } | null = null;
+    let seoData: { seoAnalysis?: string; seoHistory?: Settings['seoHistory']; migrated?: boolean } | null = null;
+    let midiaData: (Partial<Settings> & { migrated?: boolean }) | null = null;
+    let fundoData: { backgroundImage?: string; migrated?: boolean } | null = null;
+    let pagamentosData: (Partial<Settings> & { migrated?: boolean }) | null = null;
+
+    const applyMergedSettings = () => {
+      if (!geralData) return;
+
+      const merged: Settings = {
+        ...(geralData as Settings),
+        ...(midiaData?.migrated ? {
+          logo: midiaData.logo ?? geralData.logo ?? DEFAULT_LOGO,
+          hairIcon: midiaData.hairIcon ?? geralData.hairIcon,
+          makeupIcon: midiaData.makeupIcon ?? geralData.makeupIcon,
+          nailsIcon: midiaData.nailsIcon ?? geralData.nailsIcon,
+          spaIcon: midiaData.spaIcon ?? geralData.spaIcon,
+          clinicIcon: midiaData.clinicIcon ?? geralData.clinicIcon,
+          aestheticIcon: midiaData.aestheticIcon ?? geralData.aestheticIcon,
+        } : {}),
+        ...(fundoData?.migrated ? {
+          backgroundImage: fundoData.backgroundImage ?? geralData.backgroundImage,
+        } : {}),
+        ...(pagamentosData?.migrated ? {
+          zelleQR: pagamentosData.zelleQR ?? geralData.zelleQR,
+          venmoQR: pagamentosData.venmoQR ?? geralData.venmoQR,
+          paypalQR: pagamentosData.paypalQR ?? geralData.paypalQR,
+          debitCardQR: pagamentosData.debitCardQR ?? geralData.debitCardQR,
+          creditCardQR: pagamentosData.creditCardQR ?? geralData.creditCardQR,
+          pixQR: pagamentosData.pixQR ?? geralData.pixQR,
+        } : {}),
+        ...(seoData?.migrated ? {
+          seoAnalysis: seoData.seoAnalysis ?? '',
+          seoHistory: seoData.seoHistory ?? [],
+        } : {}),
+        holidays: bloqueiosData?.migrated
+          ? (bloqueiosData.holidays || [])
+          : (geralData.holidays || []),
+      };
+
+      setSettings(merged);
+      setLoading(false);
+
+      if (merged.brandName) {
+        document.title = merged.brandName;
+      }
+
+      const themeColorMeta = document.getElementById('theme-color');
+      if (themeColorMeta) {
+        themeColorMeta.setAttribute('content', merged.primaryColor || '#865d39');
+      }
+
+      const glassColor = merged.glassColor || 'rgba(255, 255, 255, 0.4)';
+      const finalGlassColor = (glassColor.startsWith('#') && glassColor.length === 7)
+        ? `${glassColor}66`
+        : glassColor;
+      document.documentElement.style.setProperty('--glass-color', finalGlassColor);
+
+      if (merged.textColor) {
+        document.documentElement.style.setProperty('--text-color', merged.textColor);
+      }
+    };
 
     const unsub = onSnapshot(doc(db, 'configuracoes', 'geral'), async (docSnap) => {
       clearTimeout(loadingTimeout);
@@ -92,27 +153,8 @@ export default function App() {
       }
 
       if (data) {
-        setSettings(data);
-        setLoading(false);
-
-        if (data.brandName) {
-          document.title = data.brandName;
-        }
-
-        const themeColorMeta = document.getElementById('theme-color');
-        if (themeColorMeta) {
-          themeColorMeta.setAttribute('content', data.primaryColor || '#865d39');
-        }
-
-        const glassColor = data.glassColor || 'rgba(255, 255, 255, 0.4)';
-        const finalGlassColor = (glassColor.startsWith('#') && glassColor.length === 7) 
-          ? `${glassColor}66` 
-          : glassColor;
-        document.documentElement.style.setProperty('--glass-color', finalGlassColor);
-
-        if (data.textColor) {
-          document.documentElement.style.setProperty('--text-color', data.textColor);
-        }
+        geralData = data;
+        applyMergedSettings();
       } else {
         setLoading(false);
       }
@@ -123,8 +165,38 @@ export default function App() {
       toast.error("Erro ao conectar ao banco de dados. Verifique suas regras e internet.");
     });
 
+    const unsubBloqueios = onSnapshot(doc(db, 'configuracoes', 'bloqueios'), (docSnap) => {
+      bloqueiosData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
+      applyMergedSettings();
+    }, (err) => console.warn("Erro ao carregar bloqueios:", err));
+
+    const unsubSeo = onSnapshot(doc(db, 'configuracoes', 'seo'), (docSnap) => {
+      seoData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
+      applyMergedSettings();
+    }, (err) => console.warn("Erro ao carregar seo:", err));
+
+    const unsubMidia = onSnapshot(doc(db, 'configuracoes', 'midia'), (docSnap) => {
+      midiaData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
+      applyMergedSettings();
+    }, (err) => console.warn("Erro ao carregar midia:", err));
+
+    const unsubFundo = onSnapshot(doc(db, 'configuracoes', 'fundo'), (docSnap) => {
+      fundoData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
+      applyMergedSettings();
+    }, (err) => console.warn("Erro ao carregar fundo:", err));
+
+    const unsubPagamentos = onSnapshot(doc(db, 'configuracoes', 'pagamentos'), (docSnap) => {
+      pagamentosData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
+      applyMergedSettings();
+    }, (err) => console.warn("Erro ao carregar pagamentos:", err));
+
     return () => {
       unsub();
+      unsubBloqueios();
+      unsubSeo();
+      unsubMidia();
+      unsubFundo();
+      unsubPagamentos();
       clearTimeout(loadingTimeout);
       window.removeEventListener('popstate', handleNavigation);
       window.removeEventListener('hashchange', handleNavigation);
