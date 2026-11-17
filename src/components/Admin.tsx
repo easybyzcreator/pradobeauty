@@ -4,7 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { 
   collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc, deleteField,
-  query, orderBy, serverTimestamp, getDocs, getDoc 
+  query, orderBy, where, serverTimestamp, getDocs, getDoc 
 } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
 import { Product, Order, Settings, Category, Side, CustomerRecord, Holiday, AnamneseForm, AnamneseQuestion, Professional, BlacklistRecord, WorkingHours, DaySchedule } from '../types';
@@ -486,13 +486,6 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
   const [horariosExtras, setHorariosExtras] = useState<any[]>([]);
 
   useEffect(() => {
-    const unsubExtras = onSnapshot(collection(db, 'horarios_extras'), (snapshot) => {
-      setHorariosExtras(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
-    });
-    return () => unsubExtras();
-  }, []);
-
-  useEffect(() => {
     const clientLink = window.location.origin;
     QRCode.toDataURL(clientLink, { width: 300, margin: 2 })
       .then(url => {
@@ -508,7 +501,21 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
   
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
-  const [orders, setOrders] = useState<Order[]>([]);
+  const [recentOrders, setRecentOrders] = useState<Order[]>([]);
+  const [archivedOrders, setArchivedOrders] = useState<Order[]>([]);
+  const [hasLoadedFullHistory, setHasLoadedFullHistory] = useState(false);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const orders = useMemo(() => {
+    if (!hasLoadedFullHistory || archivedOrders.length === 0) return recentOrders;
+    const recentMap = new Map<string, Order>();
+    recentOrders.forEach(o => recentMap.set(o.id, o));
+    const olderOnly = archivedOrders.filter(o => !recentMap.has(o.id));
+    return [...recentOrders, ...olderOnly].sort((a, b) => {
+      const aSec = (a.createdAt as any)?.seconds || 0;
+      const bSec = (b.createdAt as any)?.seconds || 0;
+      return bSec - aSec;
+    });
+  }, [recentOrders, archivedOrders, hasLoadedFullHistory]);
   const [loading, setLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -1136,9 +1143,28 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     setSettings(prev => ({ ...prev, whatsappNumber: formatted }));
   };
 
+  const loadFullOrderHistory = async () => {
+    if (isLoadingHistory) return;
+    setIsLoadingHistory(true);
+    try {
+      const snap = await getDocs(query(collection(db, 'pedidos'), orderBy('createdAt', 'desc')));
+      setArchivedOrders(snap.docs.map(d => ({ id: d.id, ...d.data() } as Order)));
+      setHasLoadedFullHistory(true);
+    } catch (err) {
+      console.error('Error loading full order history:', err);
+      toast.error('Erro ao carregar histórico completo.');
+    } finally {
+      setIsLoadingHistory(false);
+    }
+  };
+
   useEffect(() => {
     if (!isLoggedIn) return;
     setLoading(true);
+
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgoISO = `${thirtyDaysAgo.getFullYear()}-${String(thirtyDaysAgo.getMonth() + 1).padStart(2, '0')}-${String(thirtyDaysAgo.getDate()).padStart(2, '0')}`;
 
     const unsubProducts = onSnapshot(query(collection(db, 'produtos'), orderBy('title')), (snapshot) => {
       setProducts(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product)));
@@ -1149,8 +1175,18 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       setCategories(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Category)));
     });
 
-    const unsubOrders = onSnapshot(query(collection(db, 'pedidos'), orderBy('createdAt', 'desc')), (snapshot) => {
-      setOrders(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Order)));
+    const unsubOrders = onSnapshot(
+      query(collection(db, 'pedidos'), where('appointmentDate', '>=', thirtyDaysAgoISO)),
+      (snapshot) => {
+        const list = snapshot.docs
+          .map(doc => ({ id: doc.id, ...doc.data() } as Order))
+          .sort((a, b) => ((b.createdAt as any)?.seconds || 0) - ((a.createdAt as any)?.seconds || 0));
+        setRecentOrders(list);
+      }
+    );
+
+    const unsubExtras = onSnapshot(collection(db, 'horarios_extras'), (snapshot) => {
+      setHorariosExtras(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
     });
 
     const unsubSides = onSnapshot(collection(db, 'acompanhamentos'), (snapshot) => {
@@ -1185,6 +1221,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       unsubProducts();
       unsubCategories();
       unsubOrders();
+      unsubExtras();
       unsubSides();
       unsubRecords();
       unsubForms();
@@ -1195,94 +1232,16 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     };
   }, [isLoggedIn]);
 
-  // Automatic background migration to adjust older appointments to consecutive times
   useEffect(() => {
-    if (!orders || orders.length === 0) return;
-
-    const activeOrders = orders.filter(o => o.status !== 'cancelled');
-    const ordersToFix = activeOrders.filter(order => {
-      if (!order.items || order.items.length <= 1) return false;
-      const baseTime = order.appointmentTime;
-      if (!baseTime) return false;
-
-      // Filter non-empty appointmentTimes for the items
-      const times = order.items.map(i => i.appointmentTime).filter(Boolean);
-      const uniqueTimes = Array.from(new Set(times));
-
-      // If the items are already scheduled at different custom times (e.g. 11:00 AM and 12:30 PM),
-      // they do not need any consecutive adjustment. Return false to keep them intact.
-      if (uniqueTimes.length > 1) return false;
-
-      // Check if we need to adjust: if any subsequent item has appointmentTime equal to baseTime,
-      // or if it lacks appointmentTime, which indicates it wasn't consecutively scheduled.
-      let needsAdjustment = false;
-      for (let k = 1; k < order.items.length; k++) {
-        const item = order.items[k];
-        if (!item.appointmentTime || item.appointmentTime === baseTime) {
-          needsAdjustment = true;
-          break;
-        }
-      }
-      return needsAdjustment;
-    });
-
-    if (ordersToFix.length > 0) {
-      ordersToFix.forEach(async (order) => {
-        let currentTime = order.appointmentTime;
-        const consecutiveItems = order.items.map((item) => {
-          const itemTime = currentTime;
-          const itemDuration = item.duration || 30;
-          currentTime = addMinutesToTime(currentTime, itemDuration * (item.quantity || 1));
-          return {
-            ...item,
-            appointmentTime: itemTime,
-            appointmentDate: item.appointmentDate || order.appointmentDate
-          };
-        });
-
-        try {
-          await updateDoc(doc(db, 'pedidos', order.id), {
-            items: consecutiveItems
-          });
-          console.log(`Auto-migrated old order consecutive times for order ID: ${order.id}`);
-        } catch (err) {
-          console.error(`Error auto-migrating order ${order.id}:`, err);
-        }
-      });
+    if (!isLoggedIn || hasLoadedFullHistory || isLoadingHistory) return;
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgoISO = `${thirtyDaysAgo.getFullYear()}-${String(thirtyDaysAgo.getMonth() + 1).padStart(2, '0')}-${String(thirtyDaysAgo.getDate()).padStart(2, '0')}`;
+    const calISO = `${calendarDate.getFullYear()}-${String(calendarDate.getMonth() + 1).padStart(2, '0')}-${String(calendarDate.getDate()).padStart(2, '0')}`;
+    if (calISO < thirtyDaysAgoISO || (activeTab === 'finance' && financeDateRange.start && financeDateRange.start < thirtyDaysAgoISO)) {
+      loadFullOrderHistory();
     }
-  }, [orders]);
-
-  // Automatic background migration for existing manual slots date format to MM/DD/YYYY
-  useEffect(() => {
-    if (!horariosExtras || horariosExtras.length === 0) return;
-
-    horariosExtras.forEach(async (h) => {
-      if (!h.date) return;
-      const parts = h.date.split('/');
-      if (parts.length === 3) {
-        const first = parseInt(parts[0], 10);
-        
-        let shouldMigrate = false;
-        if (first > 12) {
-          shouldMigrate = true;
-        } else if (h.date === '09/07/2026') {
-          shouldMigrate = true;
-        }
-
-        if (shouldMigrate) {
-          const newDate = `${parts[1].padStart(2, '0')}/${parts[0].padStart(2, '0')}/${parts[2]}`;
-          try {
-            await updateDoc(doc(db, 'horarios_extras', h.id), {
-              date: newDate
-            });
-            console.log(`Auto-migrated extra slot date from ${h.date} to ${newDate}`);
-          } catch (err) {
-            console.error(`Error migrating extra slot date for ${h.id}:`, err);
-          }
-        }
-      }
-    });
-  }, [horariosExtras]);
+  }, [isLoggedIn, hasLoadedFullHistory, isLoadingHistory, calendarDate, activeTab, financeDateRange.start]);
 
   const handleDeptLogin = () => {};
   
@@ -5144,15 +5103,27 @@ Can we confirm your visit? ✨`;
           <div className="space-y-6">
             <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
               <h2 className="text-3xl font-serif font-bold">My Customers</h2>
-              <button 
-                onClick={() => setShowBirthdaysOnly(!showBirthdaysOnly)} 
-                className={cn(
-                  "px-4 py-2 rounded-xl font-bold text-sm w-full sm:w-auto flex items-center justify-center gap-2", 
-                  showBirthdaysOnly ? "bg-pink-500 text-white" : "bg-white border text-black"
+              <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+                {!hasLoadedFullHistory && (
+                  <button
+                    onClick={loadFullOrderHistory}
+                    disabled={isLoadingHistory}
+                    className="px-4 py-2 rounded-xl font-bold text-sm bg-white border text-black flex items-center justify-center gap-2 hover:bg-gray-50 transition-colors disabled:opacity-50"
+                  >
+                    {isLoadingHistory ? <Loader2 size={16} className="animate-spin" /> : <History size={16} />}
+                    Load Full History
+                  </button>
                 )}
-              >
-                <Cake size={16} /> Birthdays
-              </button>
+                <button 
+                  onClick={() => setShowBirthdaysOnly(!showBirthdaysOnly)} 
+                  className={cn(
+                    "px-4 py-2 rounded-xl font-bold text-sm w-full sm:w-auto flex items-center justify-center gap-2", 
+                    showBirthdaysOnly ? "bg-pink-500 text-white" : "bg-white border text-black"
+                  )}
+                >
+                  <Cake size={16} /> Birthdays
+                </button>
+              </div>
             </div>
 
             <div className="flex flex-col sm:flex-row gap-4">
@@ -5373,6 +5344,17 @@ Can we confirm your visit? ✨`;
                 >
                   <CalendarOff size={18} /> Block Period
                 </button>
+                {!hasLoadedFullHistory && (
+                  <button
+                    onClick={loadFullOrderHistory}
+                    disabled={isLoadingHistory}
+                    className="px-4 py-3 rounded-xl font-bold flex items-center gap-2 shadow-sm hover:bg-gray-50 transition-all text-xs uppercase tracking-wider bg-white border text-black/70 disabled:opacity-50"
+                    title="Carregar agendamentos com mais de 30 dias"
+                  >
+                    {isLoadingHistory ? <Loader2 size={16} className="animate-spin" /> : <History size={16} />}
+                    Older History
+                  </button>
+                )}
                 <div className="flex bg-white rounded-xl border p-1 overflow-x-auto gap-1 shadow-sm font-sans">
                   <button 
                     onClick={() => setOrderProfessionalFilter('all')}
@@ -6275,25 +6257,37 @@ Can we confirm your visit? ✨`;
                   <h2 className="text-3xl font-serif font-bold">Financial Report</h2>
                   <p className="text-xs opacity-40 uppercase font-black tracking-widest text-black">Track earnings by professional and period</p>
                 </div>
-                <div className="flex flex-wrap gap-4 items-center bg-white/40 p-2 rounded-2xl border border-white/20 shadow-sm">
-                  <div className="flex flex-col">
-                    <label className="text-[10px] font-black uppercase opacity-40 ml-2">From</label>
-                    <input 
-                      type="date" 
-                      className="p-2 bg-transparent text-sm font-bold outline-none"
-                      value={financeDateRange.start}
-                      onChange={e => setFinanceDateRange({ ...financeDateRange, start: e.target.value })}
-                    />
-                  </div>
-                  <div className="h-8 w-px bg-black/10 mx-2" />
-                  <div className="flex flex-col">
-                    <label className="text-[10px] font-black uppercase opacity-40 ml-2">To</label>
-                    <input 
-                      type="date" 
-                      className="p-2 bg-transparent text-sm font-bold outline-none"
-                      value={financeDateRange.end}
-                      onChange={e => setFinanceDateRange({ ...financeDateRange, end: e.target.value })}
-                    />
+                <div className="flex flex-wrap gap-3 items-center">
+                  {!hasLoadedFullHistory && (
+                    <button
+                      onClick={loadFullOrderHistory}
+                      disabled={isLoadingHistory}
+                      className="px-4 py-2.5 rounded-xl font-bold flex items-center gap-2 shadow-sm hover:bg-gray-50 transition-all text-xs uppercase tracking-wider bg-white border text-black/70 disabled:opacity-50"
+                    >
+                      {isLoadingHistory ? <Loader2 size={16} className="animate-spin" /> : <History size={16} />}
+                      Load Older History
+                    </button>
+                  )}
+                  <div className="flex flex-wrap gap-4 items-center bg-white/40 p-2 rounded-2xl border border-white/20 shadow-sm">
+                    <div className="flex flex-col">
+                      <label className="text-[10px] font-black uppercase opacity-40 ml-2">From</label>
+                      <input 
+                        type="date" 
+                        className="p-2 bg-transparent text-sm font-bold outline-none"
+                        value={financeDateRange.start}
+                        onChange={e => setFinanceDateRange({ ...financeDateRange, start: e.target.value })}
+                      />
+                    </div>
+                    <div className="h-8 w-px bg-black/10 mx-2" />
+                    <div className="flex flex-col">
+                      <label className="text-[10px] font-black uppercase opacity-40 ml-2">To</label>
+                      <input 
+                        type="date" 
+                        className="p-2 bg-transparent text-sm font-bold outline-none"
+                        value={financeDateRange.end}
+                        onChange={e => setFinanceDateRange({ ...financeDateRange, end: e.target.value })}
+                      />
+                    </div>
                   </div>
                 </div>
               </div>

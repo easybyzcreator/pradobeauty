@@ -3,14 +3,21 @@ import Menu from './components/Menu';
 import Admin from './components/Admin';
 import Footer from './components/Footer';
 import { db } from './firebase';
-import { doc, onSnapshot, setDoc, getDocs, collection, query, where, addDoc, serverTimestamp } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, getDocs, getDoc, collection, query } from 'firebase/firestore';
 import { Settings, Holiday } from './types';
 import { Toaster, toast } from 'sonner';
 
-import { DEFAULT_LOGO, DEFAULT_BACKGROUND, INITIAL_PRODUCTS, INITIAL_CATEGORIES } from './constants';
+import { DEFAULT_LOGO, DEFAULT_BACKGROUND } from './constants';
+
+const checkIsAdminRoute = () => {
+  if (typeof window === 'undefined') return false;
+  const path = window.location.pathname;
+  const hash = window.location.hash;
+  return path === '/admin' || hash === '#/admin' || hash === '#admin';
+};
 
 export default function App() {
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [isAdmin, setIsAdmin] = useState<boolean>(checkIsAdminRoute);
   const [settings, setSettings] = useState<Settings>({
     logo: DEFAULT_LOGO,
     primaryColor: '#865d39',
@@ -50,18 +57,21 @@ export default function App() {
 
   useEffect(() => {
     const handleNavigation = () => {
-      const path = window.location.pathname;
-      const hash = window.location.hash;
-      if (path === '/admin' || hash === '#/admin' || hash === '#admin') {
-        setIsAdmin(true);
-      } else {
-        setIsAdmin(false);
-      }
+      setIsAdmin(checkIsAdminRoute());
     };
 
     handleNavigation();
     window.addEventListener('popstate', handleNavigation);
     window.addEventListener('hashchange', handleNavigation);
+
+    return () => {
+      window.removeEventListener('popstate', handleNavigation);
+      window.removeEventListener('hashchange', handleNavigation);
+    };
+  }, []);
+
+  useEffect(() => {
+    let isCancelled = false;
 
     // Timeout de 10 segundos para o loading
     const loadingTimeout = setTimeout(() => {
@@ -154,6 +164,60 @@ export default function App() {
       }
     };
 
+    if (!isAdmin) {
+      // Public Menu: single one-time getDoc reads (cached via persistentLocalCache), no seo doc needed
+      (async () => {
+        try {
+          const [geralSnap, bloqueiosSnap, midiaSnap, fundoSnap, pagamentosSnap] = await Promise.all([
+            getDoc(doc(db, 'configuracoes', 'geral')),
+            getDoc(doc(db, 'configuracoes', 'bloqueios')),
+            getDoc(doc(db, 'configuracoes', 'midia')),
+            getDoc(doc(db, 'configuracoes', 'fundo')),
+            getDoc(doc(db, 'configuracoes', 'pagamentos')),
+          ]);
+          if (isCancelled) return;
+          clearTimeout(loadingTimeout);
+
+          let data: Settings | null = null;
+          if (geralSnap.exists()) {
+            data = geralSnap.data() as Settings;
+          } else {
+            try {
+              const oldDoc = await getDocs(query(collection(db, 'settings')));
+              if (!oldDoc.empty) {
+                data = oldDoc.docs[0].data() as Settings;
+              }
+            } catch (e) {
+              console.error("Erro ao tentar fallback de configurações:", e);
+            }
+          }
+
+          bloqueiosData = bloqueiosSnap.exists() ? (bloqueiosSnap.data() as any) : { migrated: false };
+          midiaData = midiaSnap.exists() ? (midiaSnap.data() as any) : { migrated: false };
+          fundoData = fundoSnap.exists() ? (fundoSnap.data() as any) : { migrated: false };
+          pagamentosData = pagamentosSnap.exists() ? (pagamentosSnap.data() as any) : { migrated: false };
+
+          if (data) {
+            geralData = data;
+            applyMergedSettings();
+          } else {
+            setLoading(false);
+          }
+        } catch (error) {
+          console.error("Erro na conexão com Firebase:", error);
+          clearTimeout(loadingTimeout);
+          setLoading(false);
+          toast.error("Erro ao conectar ao banco de dados. Verifique suas regras e internet.");
+        }
+      })();
+
+      return () => {
+        isCancelled = true;
+        clearTimeout(loadingTimeout);
+      };
+    }
+
+    // Admin Mode: realtime listeners including configuracoes/seo
     const unsub = onSnapshot(doc(db, 'configuracoes', 'geral'), async (docSnap) => {
       clearTimeout(loadingTimeout);
       let data: Settings | null = null;
@@ -161,12 +225,10 @@ export default function App() {
       if (docSnap.exists()) {
         data = docSnap.data() as Settings;
       } else {
-        // Fallback para tentar recuperar configurações da coleção antiga 'settings'
         try {
           const oldDoc = await getDocs(query(collection(db, 'settings')));
           if (!oldDoc.empty) {
             data = oldDoc.docs[0].data() as Settings;
-            // Se encontrar na antiga, salva na nova para migrar
             await setDoc(doc(db, 'configuracoes', 'geral'), data);
           }
         } catch (e) {
@@ -213,6 +275,7 @@ export default function App() {
     }, (err) => console.warn("Erro ao carregar pagamentos:", err));
 
     return () => {
+      isCancelled = true;
       unsub();
       unsubBloqueios();
       unsubSeo();
@@ -220,150 +283,8 @@ export default function App() {
       unsubFundo();
       unsubPagamentos();
       clearTimeout(loadingTimeout);
-      window.removeEventListener('popstate', handleNavigation);
-      window.removeEventListener('hashchange', handleNavigation);
     };
-  }, []);
-
-  useEffect(() => {
-    const seedTestData = async () => {
-      const isSeeded = localStorage.getItem('easyBeauty_seeded_v2');
-      if (isSeeded) return;
-
-      try {
-        console.log("Seeding test data...");
-        const catRefs: { [key: string]: string } = {};
-        const demoCats = [
-          { title: 'Estética Facial', dept: 'aesthetic' },
-          { title: 'Cabelo & Cor', dept: 'hair' },
-          { title: 'Manicure & Pedicure', dept: 'nails' },
-          { title: 'Maquiagem Profissional', dept: 'makeup' },
-          { title: 'Massagem & Relaxamento', dept: 'spa' }
-        ];
-
-        for (const cat of demoCats) {
-          const catQuery = query(collection(db, 'categorias'), where('department', '==', cat.dept));
-          const catSnap = await getDocs(catQuery);
-          if (catSnap.empty) {
-            const newCat = await addDoc(collection(db, 'categorias'), {
-              title: cat.title,
-              order: 0,
-              department: cat.dept
-            });
-            catRefs[cat.dept] = newCat.id;
-          } else {
-            catRefs[cat.dept] = catSnap.docs[0].id;
-          }
-        }
-
-        const products = [
-          // Aesthetic
-          { title: 'Limpeza de Pele Profunda', price: 150, duration: 60, dept: 'aesthetic', categoryId: catRefs['aesthetic'] },
-          { title: 'Botox (3 áreas)', price: 950, duration: 30, dept: 'aesthetic', categoryId: catRefs['aesthetic'] },
-          
-          // Hair
-          { title: 'Morena Iluminada', price: 350, duration: 180, dept: 'hair', categoryId: catRefs['hair'] },
-          { title: 'Corte Feminino', price: 120, duration: 45, dept: 'hair', categoryId: catRefs['hair'] },
-          { title: 'Escova & Lavagem', price: 65, duration: 40, dept: 'hair', categoryId: catRefs['hair'] },
-          
-          // Nails
-          { title: 'Pé e Mão', price: 55, duration: 90, dept: 'nails', categoryId: catRefs['nails'] },
-          { title: 'Alongamento em Fibra', price: 180, duration: 150, dept: 'nails', categoryId: catRefs['nails'] },
-          
-          // Makeup
-          { title: 'Maquiagem Social', price: 250, duration: 90, dept: 'makeup', categoryId: catRefs['makeup'] },
-          { title: 'Cílios Postiços', price: 45, duration: 15, dept: 'makeup', categoryId: catRefs['makeup'] },
-          
-          // Spa
-          { title: 'Massagem Relaxante', price: 140, duration: 60, dept: 'spa', categoryId: catRefs['spa'] }
-        ];
-
-        const productDocs: any[] = [];
-        for (const pData of products) {
-          const p = {
-            ...pData,
-            description: 'Procedimento realizado com excelência pela equipe Prado Beauty.',
-            priceType: 'fixed',
-            image: 'https://images.unsplash.com/photo-1522337660859-02fbefad4740?q=80&w=640',
-            isActive: true,
-            gender: 'feminino'
-          };
-          const pQuery = query(collection(db, 'produtos'), where('title', '==', p.title));
-          const pSnap = await getDocs(pQuery);
-          if (pSnap.empty) {
-            const docRef = await addDoc(collection(db, 'produtos'), p);
-            productDocs.push({ id: docRef.id, ...p });
-          } else {
-            productDocs.push({ id: pSnap.docs[0].id, ...pSnap.docs[0].data() });
-          }
-        }
-
-        const orders = [
-          {
-            customerName: 'Maria Silva',
-            phone: '(11) 98765-4321',
-            email: 'maria.silva@email.com',
-            status: 'pending',
-            items: [
-              {
-                title: productDocs[0].title,
-                quantity: 1,
-                price: 350,
-                priceType: productDocs[0].priceType || 'starting',
-                duration: 180,
-                department: 'hair',
-                appointmentDate: '2026-04-22',
-                appointmentTime: '09:00'
-              }
-            ],
-            total: 350,
-            createdAt: serverTimestamp(),
-            appointmentDate: '2026-04-22',
-            appointmentTime: '09:00',
-            orderLanguage: 'pt'
-          },
-          {
-            customerName: 'Ana Oliveira',
-            phone: '(11) 99988-7766',
-            email: 'ana.oli@email.com',
-            status: 'pending',
-            items: [
-              {
-                title: productDocs[1].title,
-                quantity: 1,
-                price: 120,
-                priceType: productDocs[1].priceType || 'fixed',
-                duration: 45,
-                department: 'hair',
-                appointmentDate: '2026-04-22',
-                appointmentTime: '13:00'
-              }
-            ],
-            total: 120,
-            createdAt: serverTimestamp(),
-            appointmentDate: '2026-04-22',
-            appointmentTime: '13:00',
-            orderLanguage: 'pt'
-          }
-        ];
-
-        for (const o of orders) {
-          const oQuery = query(collection(db, 'pedidos'), where('customerName', '==', o.customerName));
-          const oSnap = await getDocs(oQuery);
-          if (oSnap.empty) {
-            await addDoc(collection(db, 'pedidos'), o);
-          }
-        }
-
-        localStorage.setItem('easyBeauty_seeded_v2', 'true');
-        console.log("Seeding complete!");
-      } catch (err) {
-        console.error("Error seeding test data:", err);
-      }
-    };
-
-    seedTestData();
-  }, []);
+  }, [isAdmin]);
 
   const glassColor = settings?.glassColor || 'rgba(255, 255, 255, 0.4)';
   const finalGlassColor = (glassColor.startsWith('#') && glassColor.length === 7) 

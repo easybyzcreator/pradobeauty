@@ -1,6 +1,6 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { db } from '../firebase';
-import { collection, onSnapshot, addDoc, serverTimestamp, query, orderBy, doc, updateDoc } from 'firebase/firestore';
+import { collection, onSnapshot, addDoc, serverTimestamp, query, orderBy, doc, updateDoc, getDocs, where } from 'firebase/firestore';
 import { Product, Order, Settings, Category, CartItem, Side, Holiday, AnamneseForm, AnamneseQuestion, Professional, BlacklistRecord, WorkingHours, DaySchedule } from '../types';
 import { Plus, Minus, ShoppingBag, X, ArrowLeft, ArrowRight, Scissors, Palette, Sparkles, Clock, CheckCircle2, MessageCircle, MessageSquare, Loader2, Calendar, User, Trash2, CalendarX } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -241,6 +241,8 @@ export default function Menu({ settings }: { settings: Settings }) {
   const [allOrders, setAllOrders] = useState<Order[]>([]);
   const [professionals, setProfessionals] = useState<Professional[]>([]);
   const [blacklist, setBlacklist] = useState<BlacklistRecord[]>([]);
+  const blacklistLoadedRef = useRef(false);
+  const extrasLoadedRef = useRef(false);
   const [selectedProfessionalForDept, setSelectedProfessionalForDept] = useState<Record<string, string>>({});
   const [selectedDepartment, setSelectedDepartment] = useState<'hair' | 'makeup' | 'nails' | 'spa' | 'clinic' | 'aesthetic' | null>(null);
   const [showWelcome, setShowWelcome] = useState(true);
@@ -311,76 +313,95 @@ export default function Menu({ settings }: { settings: Settings }) {
   });
 
   useEffect(() => {
+    let isCancelled = false;
     setLoading(true);
-    
-    const unsubHorariosExtras = onSnapshot(collection(db, 'horarios_extras'), (snapshot) => {
-      const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setHorariosExtras(fetched);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar horários extras:', error);
-    });
-    const unsubProducts = onSnapshot(query(collection(db, 'produtos'), orderBy('title')), (snapshot) => {
-      const fetchedProducts = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Product));
-      setProducts(fetchedProducts);
-      setLoading(false);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar produtos:', error);
-      setLoading(false);
-    });
 
-    const unsubCategories = onSnapshot(query(collection(db, 'categorias'), orderBy('order', 'asc')), (snapshot) => {
-      const fetchedCategories = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Category));
-      setCategories(fetchedCategories);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar categorias:', error);
-    });
+    const loadStaticCatalog = async () => {
+      try {
+        const [
+          productsSnap,
+          categoriesSnap,
+          sidesSnap,
+          anamneseSnap,
+          profsSnap
+        ] = await Promise.all([
+          getDocs(query(collection(db, 'produtos'), orderBy('title'))),
+          getDocs(query(collection(db, 'categorias'), orderBy('order', 'asc'))),
+          getDocs(collection(db, 'acompanhamentos')),
+          getDocs(collection(db, 'anamnese_forms')),
+          getDocs(query(collection(db, 'profissionais'), orderBy('order', 'asc'))),
+        ]);
 
-    const unsubSides = onSnapshot(collection(db, 'acompanhamentos'), (snapshot) => {
-      const fetchedSides = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Side));
-      setSides(fetchedSides);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar acompanhamentos:', error);
-    });
+        if (isCancelled) return;
+        setProducts(productsSnap.docs.map(d => ({ id: d.id, ...d.data() } as Product)));
+        setCategories(categoriesSnap.docs.map(d => ({ id: d.id, ...d.data() } as Category)));
+        setSides(sidesSnap.docs.map(d => ({ id: d.id, ...d.data() } as Side)));
+        setAnamneseForms(anamneseSnap.docs.map(d => ({ id: d.id, ...d.data() } as AnamneseForm)));
+        setProfessionals(profsSnap.docs.map(d => ({ id: d.id, ...d.data() } as Professional)));
+      } catch (error) {
+        console.error('Menu: Erro ao carregar dados iniciais:', error);
+      } finally {
+        if (!isCancelled) setLoading(false);
+      }
+    };
 
-    const unsubAnamnese = onSnapshot(collection(db, 'anamnese_forms'), (snapshot) => {
-      const fetchedForms = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as AnamneseForm));
-      setAnamneseForms(fetchedForms);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar anamnese:', error);
-    });
-
-    const unsubOrders = onSnapshot(query(collection(db, 'pedidos'), orderBy('createdAt', 'desc')), (snapshot) => {
-      const fetchedOrders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Order));
-      setAllOrders(fetchedOrders);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar pedidos:', error);
-    });
-
-    const unsubProfessionals = onSnapshot(query(collection(db, 'profissionais'), orderBy('order', 'asc')), (snapshot) => {
-      const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Professional));
-      setProfessionals(fetched);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar profissionais:', error);
-    });
-
-    const unsubBlacklist = onSnapshot(collection(db, 'blacklist'), (snapshot) => {
-      const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as BlacklistRecord));
-      setBlacklist(fetched);
-    }, (error) => {
-      console.error('Menu: Erro ao carregar blacklist:', error);
-    });
+    loadStaticCatalog();
 
     return () => {
-      unsubProducts();
-      unsubCategories();
-      unsubSides();
-      unsubAnamnese();
-      unsubOrders();
-      unsubProfessionals();
-      unsubBlacklist();
-      unsubHorariosExtras();
+      isCancelled = true;
     };
   }, []);
+
+  // Load future appointments & extra slots only when user starts booking (cart has items)
+  useEffect(() => {
+    if (cart.length === 0) return;
+
+    let isCancelled = false;
+
+    if (!extrasLoadedRef.current) {
+      extrasLoadedRef.current = true;
+      getDocs(collection(db, 'horarios_extras'))
+        .then((snapshot) => {
+          if (isCancelled) return;
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+          const fetched = snapshot.docs
+            .map(d => ({ id: d.id, ...d.data() } as any))
+            .filter((h: any) => {
+              if (!h.date) return false;
+              const parts = String(h.date).split('/');
+              if (parts.length !== 3) return true;
+              const parsed = new Date(`${parts[2]}-${parts[0].padStart(2, '0')}-${parts[1].padStart(2, '0')}T12:00:00`);
+              return isNaN(parsed.getTime()) || parsed >= todayStart;
+            });
+          setHorariosExtras(fetched);
+        })
+        .catch((error) => {
+          extrasLoadedRef.current = false;
+          console.error('Menu: Erro ao carregar horários extras:', error);
+        });
+    }
+
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    const yesterdayISO = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+
+    const unsubOrders = onSnapshot(
+      query(collection(db, 'pedidos'), where('appointmentDate', '>=', yesterdayISO)),
+      (snapshot) => {
+        const fetchedOrders = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Order));
+        setAllOrders(fetchedOrders);
+      },
+      (error) => {
+        console.error('Menu: Erro ao carregar pedidos:', error);
+      }
+    );
+
+    return () => {
+      isCancelled = true;
+      unsubOrders();
+    };
+  }, [cart.length > 0]);
 
   useEffect(() => {
     if (formData.appointmentDate && professionals.length > 0) {
@@ -534,7 +555,19 @@ export default function Menu({ settings }: { settings: Settings }) {
     
     const hasConsultItems = cart.some(item => products.find(p => p.id === item.productId)?.priceType === 'consult');
     
-    const isBlacklisted = blacklist.some(b => 
+    let currentBlacklist = blacklist;
+    if (!blacklistLoadedRef.current) {
+      try {
+        const blSnap = await getDocs(collection(db, 'blacklist'));
+        currentBlacklist = blSnap.docs.map(d => ({ id: d.id, ...d.data() } as BlacklistRecord));
+        setBlacklist(currentBlacklist);
+        blacklistLoadedRef.current = true;
+      } catch (err) {
+        console.error('Menu: Erro ao verificar blacklist:', err);
+      }
+    }
+
+    const isBlacklisted = currentBlacklist.some(b => 
       b.phone.replace(/\D/g, '') === formData.telefone.replace(/\D/g, '') ||
       (b.email && b.email === formData.email)
     );
@@ -546,7 +579,7 @@ export default function Menu({ settings }: { settings: Settings }) {
         : 'Sorry, we could not complete your appointment. Please contact us via WhatsApp.'
       );
       
-      const matchingRecord = blacklist.find(b => 
+      const matchingRecord = currentBlacklist.find(b => 
         b.phone.replace(/\D/g, '') === formData.telefone.replace(/\D/g, '') ||
         (b.email && b.email === formData.email)
       );

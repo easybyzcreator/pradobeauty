@@ -1,6 +1,13 @@
 // Import the functions you need from the SDKs you need
 import { initializeApp, getApps, getApp } from "firebase/app";
-import { initializeFirestore, CACHE_SIZE_UNLIMITED } from "firebase/firestore";
+import {
+  initializeFirestore,
+  getFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  CACHE_SIZE_UNLIMITED,
+  Firestore
+} from "firebase/firestore";
 import { getAuth } from "firebase/auth";
 import { getAnalytics, isSupported } from "firebase/analytics";
 
@@ -18,10 +25,20 @@ const firebaseConfig = {
 // Initialize Firebase with re-initialization check
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
-// Initialize Firestore with specific settings to avoid common sandbox assertion errors
-export const db = initializeFirestore(app, {
-  experimentalForceLongPolling: true,
-});
+// Initialize Firestore with persistent local cache to minimize redundant reads
+let dbInstance: Firestore;
+try {
+  dbInstance = initializeFirestore(app, {
+    experimentalForceLongPolling: true,
+    localCache: persistentLocalCache({
+      tabManager: persistentMultipleTabManager(),
+      cacheSizeBytes: CACHE_SIZE_UNLIMITED,
+    }),
+  });
+} catch {
+  dbInstance = getFirestore(app);
+}
+export const db = dbInstance;
 
 export const auth = getAuth(app);
 
