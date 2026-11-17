@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { db } from '../firebase';
-import { collection, onSnapshot, addDoc, serverTimestamp, query, orderBy, doc, updateDoc, getDocs, where } from 'firebase/firestore';
+import { db, auth } from '../firebase';
+import { collection, addDoc, serverTimestamp, query, orderBy, doc, updateDoc, getDocs, where } from 'firebase/firestore';
+import { signInAnonymously } from 'firebase/auth';
 import { Product, Order, Settings, Category, CartItem, Side, Holiday, AnamneseForm, AnamneseQuestion, Professional, BlacklistRecord, WorkingHours, DaySchedule } from '../types';
 import { Plus, Minus, ShoppingBag, X, ArrowLeft, ArrowRight, Scissors, Palette, Sparkles, Clock, CheckCircle2, MessageCircle, MessageSquare, Loader2, Calendar, User, Trash2, CalendarX } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -243,6 +244,7 @@ export default function Menu({ settings }: { settings: Settings }) {
   const [blacklist, setBlacklist] = useState<BlacklistRecord[]>([]);
   const blacklistLoadedRef = useRef(false);
   const extrasLoadedRef = useRef(false);
+  const ordersLoadedRef = useRef(false);
   const [selectedProfessionalForDept, setSelectedProfessionalForDept] = useState<Record<string, string>>({});
   const [selectedDepartment, setSelectedDepartment] = useState<'hair' | 'makeup' | 'nails' | 'spa' | 'clinic' | 'aesthetic' | null>(null);
   const [showWelcome, setShowWelcome] = useState(true);
@@ -382,24 +384,25 @@ export default function Menu({ settings }: { settings: Settings }) {
         });
     }
 
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayISO = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
+    if (!ordersLoadedRef.current) {
+      ordersLoadedRef.current = true;
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayISO = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
 
-    const unsubOrders = onSnapshot(
-      query(collection(db, 'pedidos'), where('appointmentDate', '>=', yesterdayISO)),
-      (snapshot) => {
-        const fetchedOrders = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Order));
-        setAllOrders(fetchedOrders);
-      },
-      (error) => {
-        console.error('Menu: Erro ao carregar pedidos:', error);
-      }
-    );
+      getDocs(query(collection(db, 'pedidos'), where('appointmentDate', '>=', yesterdayISO)))
+        .then((snapshot) => {
+          if (isCancelled) return;
+          setAllOrders(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Order)));
+        })
+        .catch((error) => {
+          ordersLoadedRef.current = false;
+          console.error('Menu: Erro ao carregar pedidos:', error);
+        });
+    }
 
     return () => {
       isCancelled = true;
-      unsubOrders();
     };
   }, [cart.length > 0]);
 
@@ -558,6 +561,9 @@ export default function Menu({ settings }: { settings: Settings }) {
     let currentBlacklist = blacklist;
     if (!blacklistLoadedRef.current) {
       try {
+        if (!auth.currentUser) {
+          await signInAnonymously(auth);
+        }
         const blSnap = await getDocs(collection(db, 'blacklist'));
         currentBlacklist = blSnap.docs.map(d => ({ id: d.id, ...d.data() } as BlacklistRecord));
         setBlacklist(currentBlacklist);
@@ -717,6 +723,7 @@ export default function Menu({ settings }: { settings: Settings }) {
 
     try {
       await addDoc(collection(db, 'pedidos'), orderData);
+      ordersLoadedRef.current = false;
       
       toast.success(currentLang === 'pt' ? 'Dados salvos com sucesso!' : 'Appointment saved successfully!', { id: loadingToast });
       const now = new Date();
@@ -1479,9 +1486,10 @@ export default function Menu({ settings }: { settings: Settings }) {
                         // Check holiday/closure
                         const isHoliday = (settings.holidays || []).some((h: any) => {
                           if (typeof h === 'string') return h === dateStr;
-                          if (h.date !== dateStr) return false;
+                          if (!h || h.date !== dateStr) return false;
                           if (!h.professionalId) {
-                            const isDeptMatch = h.departments.includes('all') || (dept && h.departments.includes(dept));
+                            const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
+                            const isDeptMatch = hDepts.includes('all') || (dept && hDepts.includes(dept));
                             return isDeptMatch && !h.startTime && !h.endTime;
                           }
                           return h.professionalId === p.id && !h.startTime && !h.endTime;
@@ -1716,12 +1724,14 @@ export default function Menu({ settings }: { settings: Settings }) {
 
                                 const isHoliday = (settings.holidays || []).some((h: string | Holiday) => {
                                   if (typeof h === 'string') return h === dateStr;
+                                  if (!h) return false;
                                   const isDateMatch = h.date === dateStr;
                                   if (!isDateMatch) return false;
 
                                   // General or department closures
                                   if (!h.professionalId) {
-                                    const isDeptMatch = h.departments.includes('all') || (dept && h.departments.includes(dept));
+                                    const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
+                                    const isDeptMatch = hDepts.includes('all') || (dept && hDepts.includes(dept));
                                     return isDeptMatch && !h.startTime && !h.endTime;
                                   }
 
@@ -1851,12 +1861,13 @@ export default function Menu({ settings }: { settings: Settings }) {
                                       });
                                       
                                       const isBlockedPeriod = (settings.holidays || []).some((h: any) => {
-                                        if (typeof h === 'string') return false;
+                                        if (typeof h === 'string' || !h) return false;
                                         if (h.date !== dateStr) return false;
                                         if (!h.startTime || !h.endTime) return false;
                                         if (h.professionalId && h.professionalId !== selectedProfId) return false;
                                         if (!h.professionalId) {
-                                          const isDeptMatch = h.departments.includes('all') || (dept && h.departments.includes(dept));
+                                          const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
+                                          const isDeptMatch = hDepts.includes('all') || (dept && hDepts.includes(dept));
                                           if (!isDeptMatch) return false;
                                         }
                                         const bStart = new Date(`${dateStr}T${h.startTime}:00`);

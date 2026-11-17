@@ -741,9 +741,10 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
 
         const isHoliday = (settings.holidays || []).some((h: any) => {
           if (typeof h === 'string') return h === dateStr;
-          if (h.date !== dateStr) return false;
+          if (!h || h.date !== dateStr) return false;
           if (!h.professionalId) {
-            const isDeptMatch = h.departments.includes('all') || (item.department && h.departments.includes(item.department));
+            const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
+            const isDeptMatch = hDepts.includes('all') || (item.department && hDepts.includes(item.department));
             return isDeptMatch && !h.startTime && !h.endTime;
           }
           return h.professionalId === profId && !h.startTime && !h.endTime;
@@ -755,12 +756,13 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         }
 
         const isBlockedPeriod = (settings.holidays || []).some((h: any) => {
-          if (typeof h === 'string') return false;
+          if (typeof h === 'string' || !h) return false;
           if (h.date !== dateStr) return false;
           if (!h.startTime || !h.endTime) return false;
           if (h.professionalId && h.professionalId !== profId) return false;
           if (!h.professionalId) {
-            const isDeptMatch = h.departments.includes('all') || (item.department && h.departments.includes(item.department));
+            const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
+            const isDeptMatch = hDepts.includes('all') || (item.department && hDepts.includes(item.department));
             if (!isDeptMatch) return false;
           }
           const bStart = new Date(`${dateStr}T${h.startTime}:00`);
@@ -1298,25 +1300,57 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     }
   };
 
+  const normalizeHolidayDateStr = (rawDate: string): string => {
+    if (!rawDate || typeof rawDate !== 'string') return '';
+    const trimmed = rawDate.trim();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+    const slashMatch = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (slashMatch) {
+      return `${slashMatch[3]}-${slashMatch[1].padStart(2, '0')}-${slashMatch[2].padStart(2, '0')}`;
+    }
+    return trimmed;
+  };
+
   const mergeUniqueHolidaysList = (
     ...lists: ((string | Holiday)[] | undefined)[]
   ): (string | Holiday)[] => {
     const seen = new Set<string>();
     const result: (string | Holiday)[] = [];
+    const minActiveDate = '2026-11-01';
+
     for (const list of lists) {
       if (!Array.isArray(list)) continue;
-      for (const item of list) {
-        if (!item) continue;
+      for (const rawItem of list) {
+        if (!rawItem) continue;
+        const item: string | Holiday = typeof rawItem === 'string'
+          ? normalizeHolidayDateStr(rawItem)
+          : {
+              ...rawItem,
+              date: normalizeHolidayDateStr(rawItem.date),
+              departments: Array.isArray(rawItem.departments) && rawItem.departments.length > 0
+                ? rawItem.departments
+                : ['all'],
+            };
+
+        const itemDate = typeof item === 'string' ? item : item.date;
+        if (itemDate && /^\d{4}-\d{2}-\d{2}$/.test(itemDate) && itemDate < minActiveDate) {
+          continue;
+        }
+
         const key = typeof item === 'string'
           ? `str:${item}`
-          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(item.departments || []).join(',')}|${item.notes || ''}`;
+          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(Array.isArray(item.departments) ? item.departments : ['all']).join(',')}|${item.notes || ''}`;
         if (!seen.has(key)) {
           seen.add(key);
           result.push(item);
         }
       }
     }
-    return result;
+    return result.sort((a, b) => {
+      const dA = typeof a === 'string' ? a : (a.date || '');
+      const dB = typeof b === 'string' ? b : (b.date || '');
+      return dA.localeCompare(dB);
+    });
   };
 
   const saveHolidaysToFirestore = async (nextHolidays: (string | Holiday)[], isDeletion: boolean = false) => {
@@ -1324,19 +1358,15 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
       await signInAnonymously(auth);
     }
 
-    let finalList = nextHolidays;
+    let finalList = mergeUniqueHolidaysList(nextHolidays);
     if (!isDeletion) {
-      try {
-        const [bloqueiosSnap, geralSnap] = await Promise.all([
-          getDoc(doc(db, 'configuracoes', 'bloqueios')),
-          getDoc(doc(db, 'configuracoes', 'geral')),
-        ]);
-        const existingBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
-        const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
-        finalList = mergeUniqueHolidaysList(existingGeral, existingBloqueios, nextHolidays);
-      } catch (fetchErr) {
-        console.warn('Could not fetch latest holidays before merge, using local list:', fetchErr);
-      }
+      const [bloqueiosSnap, geralSnap] = await Promise.all([
+        getDoc(doc(db, 'configuracoes', 'bloqueios')),
+        getDoc(doc(db, 'configuracoes', 'geral')),
+      ]);
+      const existingBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
+      const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
+      finalList = mergeUniqueHolidaysList(existingGeral, existingBloqueios, nextHolidays);
     }
 
     const cleanHolidays = JSON.parse(JSON.stringify(finalList));
@@ -1463,7 +1493,7 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         seoHistory: seoHistory || [],
         migrated: true,
       }));
-      let mergedHolidays = holidays || [];
+      let mergedHolidays: (string | Holiday)[] | null = null;
       try {
         const [bloqueiosSnap, geralSnap] = await Promise.all([
           getDoc(doc(db, 'configuracoes', 'bloqueios')),
@@ -1473,17 +1503,23 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
         mergedHolidays = mergeUniqueHolidaysList(existingGeral, existingBloqueios, holidays || []);
       } catch (fetchErr) {
-        console.warn('Could not merge holidays during saveSettings:', fetchErr);
+        console.warn('Could not merge holidays during saveSettings, skipping bloqueios overwrite:', fetchErr);
       }
-      const cleanHolidays = JSON.parse(JSON.stringify(mergedHolidays));
 
-      await Promise.all([
+      const writePromises: Promise<any>[] = [
         setDoc(doc(db, 'configuracoes', 'midia'), cleanMidia),
         setDoc(doc(db, 'configuracoes', 'fundo'), cleanFundo),
         setDoc(doc(db, 'configuracoes', 'pagamentos'), cleanPagamentos),
         setDoc(doc(db, 'configuracoes', 'seo'), cleanSeo),
-        setDoc(doc(db, 'configuracoes', 'bloqueios'), { holidays: cleanHolidays, migrated: true }),
-      ]);
+      ];
+      if (mergedHolidays !== null) {
+        const cleanHolidays = JSON.parse(JSON.stringify(mergedHolidays));
+        writePromises.push(
+          setDoc(doc(db, 'configuracoes', 'bloqueios'), { holidays: cleanHolidays, migrated: true })
+        );
+      }
+
+      await Promise.all(writePromises);
 
       await setDoc(doc(db, 'configuracoes', 'geral'), cleanCore);
       toast.success('Settings saved successfully!');
@@ -3761,9 +3797,24 @@ Can we confirm your visit? ✨`;
         )}
         {activeTab === 'holidays' && (
           <div className="max-w-3xl space-y-8">
-            <div>
-              <h2 className="text-3xl font-serif font-bold">Holidays and Closures</h2>
-              <p className="text-sm opacity-60">Specific dates when specific departments or the entire salon will be closed.</p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-3xl font-serif font-bold">Holidays and Closures</h2>
+                <p className="text-sm opacity-60">Showing active blocks from Nov 2026 onwards ({(settings.holidays || []).length} active).</p>
+              </div>
+              <button
+                onClick={async () => {
+                  try {
+                    await saveHolidaysToFirestore(settings.holidays || [], false);
+                    toast.success('Old expired blocks (before Nov 2026) cleaned from Firebase!');
+                  } catch (err: any) {
+                    toast.error(`Error cleaning old blocks: ${err?.message || 'Check connection'}`);
+                  }
+                }}
+                className="px-4 py-2 rounded-xl text-xs font-bold border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 transition-colors shrink-0"
+              >
+                Clean Pre-Nov 2026 in Firebase
+              </button>
             </div>
             
             <div className="glass p-6 rounded-2xl space-y-4">
@@ -3845,8 +3896,8 @@ Can we confirm your visit? ✨`;
             <div className="grid grid-cols-1 gap-4">
               {settings.holidays?.map((h, idx) => {
                 const isLegacy = typeof h === 'string';
-                const date = isLegacy ? h : h.date;
-                const depts = isLegacy ? ['all'] : h.departments;
+                const date = isLegacy ? h : (h?.date || '');
+                const depts = isLegacy ? ['all'] : (Array.isArray(h?.departments) && h.departments.length > 0 ? h.departments : ['all']);
                 const deptLabels = { 
                   all: 'All', 
                   hair: settings.hairLabel || 'Hair', 
@@ -5437,20 +5488,21 @@ Can we confirm your visit? ✨`;
                             const dateStr = date.toLocaleDateString('en-US');
 
                             const activeHolidays = (settings.holidays || []).filter((h: any) => {
-                              if (typeof h === 'string') return false;
+                              if (typeof h === 'string' || !h) return false;
                               if (h.date !== isoDateStr) return false;
                               if (!h.startTime || !h.endTime) return false;
 
+                              const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
                               if (h.professionalId) {
                                 if (orderProfessionalFilter !== 'all' && h.professionalId !== orderProfessionalFilter) return false;
                               } else {
                                 if (orderProfessionalFilter !== 'all') {
                                   const selectedProf = professionals.find(p => p.id === orderProfessionalFilter);
-                                  const isDeptMatch = h.departments.includes('all') || 
-                                    (selectedProf?.departments && selectedProf.departments.some(d => h.departments.includes(d)));
+                                  const isDeptMatch = hDepts.includes('all') || 
+                                    (selectedProf?.departments && selectedProf.departments.some(d => hDepts.includes(d)));
                                   if (!isDeptMatch) return false;
                                 } else {
-                                  if (!h.departments.includes('all')) return false;
+                                  if (!hDepts.includes('all')) return false;
                                 }
                               }
 
@@ -5673,15 +5725,16 @@ Can we confirm your visit? ✨`;
                                 const dateStr = calendarDate.toLocaleDateString('en-US');
 
                                 const activeHolidays = (settings.holidays || []).filter((h: any) => {
-                                  if (typeof h === 'string') return false;
+                                  if (typeof h === 'string' || !h) return false;
                                   if (h.date !== isoDateStr) return false;
                                   if (!h.startTime || !h.endTime) return false;
 
+                                  const hDepts = Array.isArray(h.departments) ? h.departments : ['all'];
                                   if (h.professionalId) {
                                     if (h.professionalId !== prof.id) return false;
                                   } else {
-                                    const isDeptMatch = h.departments.includes('all') || 
-                                      (prof.departments && prof.departments.some((d: any) => h.departments.includes(d)));
+                                    const isDeptMatch = hDepts.includes('all') || 
+                                      (prof.departments && prof.departments.some((d: any) => hDepts.includes(d)));
                                     if (!isDeptMatch) return false;
                                   }
 

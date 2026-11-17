@@ -85,25 +85,57 @@ export default function App() {
     let fundoData: { backgroundImage?: string; migrated?: boolean } | null = null;
     let pagamentosData: (Partial<Settings> & { migrated?: boolean }) | null = null;
 
+    const normalizeHolidayDate = (rawDate: string): string => {
+      if (!rawDate || typeof rawDate !== 'string') return '';
+      const trimmed = rawDate.trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+      const slashMatch = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (slashMatch) {
+        return `${slashMatch[3]}-${slashMatch[1].padStart(2, '0')}-${slashMatch[2].padStart(2, '0')}`;
+      }
+      return trimmed;
+    };
+
     const mergeUniqueHolidays = (
       listA: (string | Holiday)[] = [],
       listB: (string | Holiday)[] = []
     ): (string | Holiday)[] => {
       const seen = new Set<string>();
       const result: (string | Holiday)[] = [];
-      const addItem = (item: string | Holiday) => {
-        if (!item) return;
+      const minActiveDate = '2026-11-01';
+
+      const addItem = (rawItem: string | Holiday) => {
+        if (!rawItem) return;
+        const item: string | Holiday = typeof rawItem === 'string'
+          ? normalizeHolidayDate(rawItem)
+          : {
+              ...rawItem,
+              date: normalizeHolidayDate(rawItem.date),
+              departments: Array.isArray(rawItem.departments) && rawItem.departments.length > 0
+                ? rawItem.departments
+                : ['all'],
+            };
+
+        const itemDate = typeof item === 'string' ? item : item.date;
+        if (itemDate && /^\d{4}-\d{2}-\d{2}$/.test(itemDate) && itemDate < minActiveDate) {
+          return;
+        }
+
         const key = typeof item === 'string'
           ? `str:${item}`
-          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(item.departments || []).join(',')}|${item.notes || ''}`;
+          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(Array.isArray(item.departments) ? item.departments : ['all']).join(',')}|${item.notes || ''}`;
         if (!seen.has(key)) {
           seen.add(key);
           result.push(item);
         }
       };
-      listA.forEach(addItem);
-      listB.forEach(addItem);
-      return result;
+      (Array.isArray(listA) ? listA : []).forEach(addItem);
+      (Array.isArray(listB) ? listB : []).forEach(addItem);
+      return result.sort((a, b) => {
+        const dA = typeof a === 'string' ? a : (a.date || '');
+        const dB = typeof b === 'string' ? b : (b.date || '');
+        return dA.localeCompare(dB);
+      });
     };
 
     const applyMergedSettings = () => {
@@ -254,34 +286,25 @@ export default function App() {
       applyMergedSettings();
     }, (err) => console.warn("Erro ao carregar bloqueios:", err));
 
-    const unsubSeo = onSnapshot(doc(db, 'configuracoes', 'seo'), (docSnap) => {
-      seoData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
+    // Static admin sections loaded once via getDoc (Admin updates local state directly on save)
+    Promise.all([
+      getDoc(doc(db, 'configuracoes', 'seo')),
+      getDoc(doc(db, 'configuracoes', 'midia')),
+      getDoc(doc(db, 'configuracoes', 'fundo')),
+      getDoc(doc(db, 'configuracoes', 'pagamentos')),
+    ]).then(([seoSnap, midiaSnap, fundoSnap, pagamentosSnap]) => {
+      if (isCancelled) return;
+      seoData = seoSnap.exists() ? (seoSnap.data() as any) : { migrated: false };
+      midiaData = midiaSnap.exists() ? (midiaSnap.data() as any) : { migrated: false };
+      fundoData = fundoSnap.exists() ? (fundoSnap.data() as any) : { migrated: false };
+      pagamentosData = pagamentosSnap.exists() ? (pagamentosSnap.data() as any) : { migrated: false };
       applyMergedSettings();
-    }, (err) => console.warn("Erro ao carregar seo:", err));
-
-    const unsubMidia = onSnapshot(doc(db, 'configuracoes', 'midia'), (docSnap) => {
-      midiaData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
-      applyMergedSettings();
-    }, (err) => console.warn("Erro ao carregar midia:", err));
-
-    const unsubFundo = onSnapshot(doc(db, 'configuracoes', 'fundo'), (docSnap) => {
-      fundoData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
-      applyMergedSettings();
-    }, (err) => console.warn("Erro ao carregar fundo:", err));
-
-    const unsubPagamentos = onSnapshot(doc(db, 'configuracoes', 'pagamentos'), (docSnap) => {
-      pagamentosData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
-      applyMergedSettings();
-    }, (err) => console.warn("Erro ao carregar pagamentos:", err));
+    }).catch((err) => console.warn("Erro ao carregar configurações estáticas do admin:", err));
 
     return () => {
       isCancelled = true;
       unsub();
       unsubBloqueios();
-      unsubSeo();
-      unsubMidia();
-      unsubFundo();
-      unsubPagamentos();
       clearTimeout(loadingTimeout);
     };
   }, [isAdmin]);
