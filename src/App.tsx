@@ -3,7 +3,7 @@ import Menu from './components/Menu';
 import Admin from './components/Admin';
 import Footer from './components/Footer';
 import { db } from './firebase';
-import { doc, onSnapshot, setDoc, getDocs, getDoc, collection, query } from 'firebase/firestore';
+import { doc, onSnapshot, setDoc, getDocs, getDoc, collection, query, where } from 'firebase/firestore';
 import { Settings, Holiday } from './types';
 import { Toaster, toast } from 'sonner';
 
@@ -78,8 +78,12 @@ export default function App() {
       setLoading(false);
     }, 10000);
 
+    const nowDate = new Date();
+    const startOfCurrentMonthISO = `${nowDate.getFullYear()}-${String(nowDate.getMonth() + 1).padStart(2, '0')}-01`;
+
     let geralData: Partial<Settings> | null = null;
-    let bloqueiosData: { holidays?: (string | Holiday)[]; migrated?: boolean } | null = null;
+    let bloqueiosColItems: Holiday[] = [];
+    let legacyBloqueiosData: { holidays?: (string | Holiday)[]; migrated?: boolean } | null = null;
     let seoData: { seoAnalysis?: string; seoHistory?: Settings['seoHistory']; migrated?: boolean } | null = null;
     let midiaData: (Partial<Settings> & { migrated?: boolean }) | null = null;
     let fundoData: { backgroundImage?: string; migrated?: boolean } | null = null;
@@ -97,41 +101,41 @@ export default function App() {
     };
 
     const mergeUniqueHolidays = (
-      listA: (string | Holiday)[] = [],
-      listB: (string | Holiday)[] = []
+      ...lists: ((string | Holiday)[] | undefined)[]
     ): (string | Holiday)[] => {
-      const seen = new Set<string>();
-      const result: (string | Holiday)[] = [];
-      const minActiveDate = '2026-11-01';
+      const byKey = new Map<string, string | Holiday>();
 
-      const addItem = (rawItem: string | Holiday) => {
-        if (!rawItem) return;
-        const item: string | Holiday = typeof rawItem === 'string'
-          ? normalizeHolidayDate(rawItem)
-          : {
-              ...rawItem,
-              date: normalizeHolidayDate(rawItem.date),
-              departments: Array.isArray(rawItem.departments) && rawItem.departments.length > 0
-                ? rawItem.departments
-                : ['all'],
-            };
+      for (const list of lists) {
+        if (!Array.isArray(list)) continue;
+        for (const rawItem of list) {
+          if (!rawItem) continue;
+          const item: string | Holiday = typeof rawItem === 'string'
+            ? normalizeHolidayDate(rawItem)
+            : {
+                ...rawItem,
+                date: normalizeHolidayDate(rawItem.date),
+                departments: Array.isArray(rawItem.departments) && rawItem.departments.length > 0
+                  ? rawItem.departments
+                  : ['all'],
+              };
 
-        const itemDate = typeof item === 'string' ? item : item.date;
-        if (itemDate && /^\d{4}-\d{2}-\d{2}$/.test(itemDate) && itemDate < minActiveDate) {
-          return;
+          const itemDate = typeof item === 'string' ? item : item.date;
+          if (itemDate && /^\d{4}-\d{2}-\d{2}$/.test(itemDate) && itemDate < startOfCurrentMonthISO) {
+            continue;
+          }
+
+          const key = typeof item === 'string'
+            ? `str:${item}`
+            : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(Array.isArray(item.departments) ? item.departments : ['all']).join(',')}|${item.notes || ''}`;
+
+          const existing = byKey.get(key);
+          if (!existing || (typeof item !== 'string' && item.id && (typeof existing === 'string' || !existing.id))) {
+            byKey.set(key, item);
+          }
         }
+      }
 
-        const key = typeof item === 'string'
-          ? `str:${item}`
-          : `obj:${item.date || ''}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(Array.isArray(item.departments) ? item.departments : ['all']).join(',')}|${item.notes || ''}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          result.push(item);
-        }
-      };
-      (Array.isArray(listA) ? listA : []).forEach(addItem);
-      (Array.isArray(listB) ? listB : []).forEach(addItem);
-      return result.sort((a, b) => {
+      return Array.from(byKey.values()).sort((a, b) => {
         const dA = typeof a === 'string' ? a : (a.date || '');
         const dB = typeof b === 'string' ? b : (b.date || '');
         return dA.localeCompare(dB);
@@ -168,8 +172,9 @@ export default function App() {
           seoHistory: seoData.seoHistory ?? [],
         } : {}),
         holidays: mergeUniqueHolidays(
+          bloqueiosColItems,
           geralData.holidays || [],
-          bloqueiosData?.holidays || []
+          legacyBloqueiosData?.holidays || []
         ),
       };
 
@@ -197,12 +202,12 @@ export default function App() {
     };
 
     if (!isAdmin) {
-      // Public Menu: single one-time getDoc reads (cached via persistentLocalCache), no seo doc needed
+      // Public Menu: single one-time getDoc reads + native date-filtered query on collection('bloqueios')
       (async () => {
         try {
-          const [geralSnap, bloqueiosSnap, midiaSnap, fundoSnap, pagamentosSnap] = await Promise.all([
+          const [geralSnap, bloqueiosQuerySnap, midiaSnap, fundoSnap, pagamentosSnap] = await Promise.all([
             getDoc(doc(db, 'configuracoes', 'geral')),
-            getDoc(doc(db, 'configuracoes', 'bloqueios')),
+            getDocs(query(collection(db, 'bloqueios'), where('date', '>=', startOfCurrentMonthISO))).catch(() => null),
             getDoc(doc(db, 'configuracoes', 'midia')),
             getDoc(doc(db, 'configuracoes', 'fundo')),
             getDoc(doc(db, 'configuracoes', 'pagamentos')),
@@ -224,7 +229,22 @@ export default function App() {
             }
           }
 
-          bloqueiosData = bloqueiosSnap.exists() ? (bloqueiosSnap.data() as any) : { migrated: false };
+          if (bloqueiosQuerySnap) {
+            bloqueiosColItems = bloqueiosQuerySnap.docs.map(d => ({ id: d.id, ...d.data() } as Holiday));
+          }
+
+          // Fallback to legacy configuracoes/bloqueios ONLY if collection migration hasn't completed or rule wasn't published yet
+          if (!data?.bloqueiosCollectionReady || !bloqueiosQuerySnap) {
+            try {
+              const legacySnap = await getDoc(doc(db, 'configuracoes', 'bloqueios'));
+              if (!isCancelled && legacySnap.exists()) {
+                legacyBloqueiosData = legacySnap.data() as any;
+              }
+            } catch (e) {
+              console.warn("Erro ao ler fallback legado de bloqueios:", e);
+            }
+          }
+
           midiaData = midiaSnap.exists() ? (midiaSnap.data() as any) : { migrated: false };
           fundoData = fundoSnap.exists() ? (fundoSnap.data() as any) : { migrated: false };
           pagamentosData = pagamentosSnap.exists() ? (pagamentosSnap.data() as any) : { migrated: false };
@@ -249,7 +269,8 @@ export default function App() {
       };
     }
 
-    // Admin Mode: realtime listeners including configuracoes/seo
+    // Admin Mode: realtime listener on configuracoes/geral and native collection('bloqueios') filtered from current month
+    let fetchedLegacyFallback = false;
     const unsub = onSnapshot(doc(db, 'configuracoes', 'geral'), async (docSnap) => {
       clearTimeout(loadingTimeout);
       let data: Settings | null = null;
@@ -270,6 +291,17 @@ export default function App() {
 
       if (data) {
         geralData = data;
+        if (!data.bloqueiosCollectionReady && !fetchedLegacyFallback) {
+          fetchedLegacyFallback = true;
+          getDoc(doc(db, 'configuracoes', 'bloqueios')).then((legacySnap) => {
+            if (!isCancelled && legacySnap.exists()) {
+              legacyBloqueiosData = legacySnap.data() as any;
+              applyMergedSettings();
+            }
+          }).catch(() => {});
+        } else if (data.bloqueiosCollectionReady) {
+          legacyBloqueiosData = null;
+        }
         applyMergedSettings();
       } else {
         setLoading(false);
@@ -281,10 +313,22 @@ export default function App() {
       toast.error("Erro ao conectar ao banco de dados. Verifique suas regras e internet.");
     });
 
-    const unsubBloqueios = onSnapshot(doc(db, 'configuracoes', 'bloqueios'), (docSnap) => {
-      bloqueiosData = docSnap.exists() ? (docSnap.data() as any) : { migrated: false };
-      applyMergedSettings();
-    }, (err) => console.warn("Erro ao carregar bloqueios:", err));
+    const unsubBloqueios = onSnapshot(
+      query(collection(db, 'bloqueios'), where('date', '>=', startOfCurrentMonthISO)),
+      (snap) => {
+        bloqueiosColItems = snap.docs.map(d => ({ id: d.id, ...d.data() } as Holiday));
+        applyMergedSettings();
+      },
+      (err) => {
+        console.warn("Erro ao carregar coleção bloqueios (usando fallback):", err);
+        getDoc(doc(db, 'configuracoes', 'bloqueios')).then((legacySnap) => {
+          if (!isCancelled && legacySnap.exists()) {
+            legacyBloqueiosData = legacySnap.data() as any;
+            applyMergedSettings();
+          }
+        }).catch(() => {});
+      }
+    );
 
     // Static admin sections loaded once via getDoc (Admin updates local state directly on save)
     Promise.all([

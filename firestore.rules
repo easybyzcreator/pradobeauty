@@ -20,6 +20,11 @@ service cloud.firestore {
       allow write: if isSignedIn();
     }
 
+    match /bloqueios/{docId} {
+      allow read: if true;
+      allow write: if isSignedIn();
+    }
+
     match /categorias/{docId} {
       allow read: if true;
       allow write: if isSignedIn();

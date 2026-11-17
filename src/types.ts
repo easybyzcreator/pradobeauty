@@ -136,6 +136,7 @@ export interface Order {
 }
 
 export interface Holiday {
+  id?: string;
   date: string;
   departments: ('hair' | 'makeup' | 'nails' | 'spa' | 'clinic' | 'aesthetic' | 'all')[];
   professionalId?: string;
@@ -235,6 +236,7 @@ export interface Settings {
   noShowFee?: number;
   noShowMessageTemplate?: string;
   noShowPaymentInstructions?: string;
+  bloqueiosCollectionReady?: boolean;
 }
 
 export interface DaySchedule {

@@ -4,7 +4,7 @@ import { GoogleGenAI } from "@google/genai";
 import ReactMarkdown from 'react-markdown';
 import { 
   collection, onSnapshot, addDoc, updateDoc, deleteDoc, doc, setDoc, deleteField,
-  query, orderBy, where, serverTimestamp, getDocs, getDoc 
+  query, orderBy, where, serverTimestamp, getDocs, getDoc, writeBatch 
 } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
 import { Product, Order, Settings, Category, Side, CustomerRecord, Holiday, AnamneseForm, AnamneseQuestion, Professional, BlacklistRecord, WorkingHours, DaySchedule } from '../types';
@@ -1311,12 +1311,17 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     return trimmed;
   };
 
+  const getStartOfCurrentMonthISO = () => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`;
+  };
+
   const mergeUniqueHolidaysList = (
     ...lists: ((string | Holiday)[] | undefined)[]
   ): (string | Holiday)[] => {
     const seen = new Set<string>();
     const result: (string | Holiday)[] = [];
-    const minActiveDate = '2026-11-01';
+    const minActiveDate = getStartOfCurrentMonthISO();
 
     for (const list of lists) {
       if (!Array.isArray(list)) continue;
@@ -1353,35 +1358,112 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
     });
   };
 
-  const saveHolidaysToFirestore = async (nextHolidays: (string | Holiday)[], isDeletion: boolean = false) => {
+  const toHolidayObject = (rawItem: string | Holiday): Holiday => {
+    if (typeof rawItem === 'string') {
+      return { date: normalizeHolidayDateStr(rawItem), departments: ['all'] };
+    }
+    const clean: Holiday = {
+      date: normalizeHolidayDateStr(rawItem.date),
+      departments: Array.isArray(rawItem.departments) && rawItem.departments.length > 0
+        ? rawItem.departments
+        : ['all'],
+    };
+    if (rawItem.professionalId) clean.professionalId = rawItem.professionalId;
+    if (rawItem.startTime) clean.startTime = rawItem.startTime;
+    if (rawItem.endTime) clean.endTime = rawItem.endTime;
+    if (rawItem.notes) clean.notes = rawItem.notes;
+    return clean;
+  };
+
+  const buildBlockDocId = (item: Holiday): string => {
+    const raw = `${item.date}|${item.startTime || ''}|${item.endTime || ''}|${item.professionalId || ''}|${(Array.isArray(item.departments) ? item.departments : ['all']).join(',')}|${item.notes || ''}`;
+    let h1 = 0x811c9dc5;
+    let h2 = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw.charCodeAt(i);
+      h1 ^= c;
+      h1 = Math.imul(h1, 0x01000193);
+      h2 = ((h2 << 5) - h2 + c) | 0;
+    }
+    const cleanDate = (item.date || 'nodate').replace(/[^0-9-]/g, '');
+    return `blk_${cleanDate}_${(h1 >>> 0).toString(36)}_${Math.abs(h2).toString(36)}`;
+  };
+
+  const bloqueiosMigrationAttemptedRef = React.useRef(false);
+  useEffect(() => {
+    if (!isLoggedIn || bloqueiosMigrationAttemptedRef.current) return;
+    if (settings.bloqueiosCollectionReady) return;
+    bloqueiosMigrationAttemptedRef.current = true;
+
+    (async () => {
+      try {
+        if (!auth.currentUser) {
+          await signInAnonymously(auth);
+        }
+        const [bloqueiosSnap, geralSnap] = await Promise.all([
+          getDoc(doc(db, 'configuracoes', 'bloqueios')),
+          getDoc(doc(db, 'configuracoes', 'geral')),
+        ]);
+        if (geralSnap.exists() && geralSnap.data()?.bloqueiosCollectionReady) {
+          return;
+        }
+        const legacyBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
+        const legacyGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
+        const activeItems = mergeUniqueHolidaysList(legacyGeral, legacyBloqueios);
+
+        const chunkSize = 400;
+        for (let i = 0; i < activeItems.length; i += chunkSize) {
+          const chunk = activeItems.slice(i, i + chunkSize);
+          const batch = writeBatch(db);
+          chunk.forEach((rawItem) => {
+            const obj = toHolidayObject(rawItem);
+            if (!obj.date) return;
+            const docId = buildBlockDocId(obj);
+            batch.set(doc(db, 'bloqueios', docId), JSON.parse(JSON.stringify(obj)));
+          });
+          await batch.commit();
+        }
+
+        await updateDoc(doc(db, 'configuracoes', 'geral'), {
+          bloqueiosCollectionReady: true,
+        });
+      } catch (err) {
+        console.warn('Auto-migration of bloqueios collection deferred:', err);
+      }
+    })();
+  }, [isLoggedIn, settings.bloqueiosCollectionReady]);
+
+  const addHolidayBlock = async (hObj: Holiday) => {
     if (!auth.currentUser) {
       await signInAnonymously(auth);
     }
+    const cleanObj = JSON.parse(JSON.stringify(toHolidayObject(hObj))) as Holiday;
+    const docId = buildBlockDocId(cleanObj);
+    await setDoc(doc(db, 'bloqueios', docId), cleanObj);
+    setSettings(prev => ({
+      ...prev,
+      holidays: mergeUniqueHolidaysList(prev.holidays || [], [{ ...cleanObj, id: docId }])
+    }));
+  };
 
-    let finalList = mergeUniqueHolidaysList(nextHolidays);
-    if (!isDeletion) {
-      const [bloqueiosSnap, geralSnap] = await Promise.all([
-        getDoc(doc(db, 'configuracoes', 'bloqueios')),
-        getDoc(doc(db, 'configuracoes', 'geral')),
-      ]);
-      const existingBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
-      const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
-      finalList = mergeUniqueHolidaysList(existingGeral, existingBloqueios, nextHolidays);
+  const deleteHolidayBlock = async (target: string | Holiday) => {
+    if (!auth.currentUser) {
+      await signInAnonymously(auth);
     }
+    const normalizedObj = toHolidayObject(target);
+    const targetId = typeof target !== 'string' && target.id ? target.id : buildBlockDocId(normalizedObj);
+    await deleteDoc(doc(db, 'bloqueios', targetId));
 
-    const cleanHolidays = JSON.parse(JSON.stringify(finalList));
-    await setDoc(doc(db, 'configuracoes', 'bloqueios'), {
-      holidays: cleanHolidays,
-      migrated: true,
-    });
-    try {
-      await updateDoc(doc(db, 'configuracoes', 'geral'), {
-        holidays: deleteField(),
-      });
-    } catch (cleanupErr) {
-      console.warn('Could not clean legacy holidays from geral:', cleanupErr);
-    }
-    setSettings(prev => ({ ...prev, holidays: cleanHolidays }));
+    const targetKey = `${normalizedObj.date}|${normalizedObj.startTime || ''}|${normalizedObj.endTime || ''}|${normalizedObj.professionalId || ''}|${(normalizedObj.departments || ['all']).join(',')}|${normalizedObj.notes || ''}`;
+    setSettings(prev => ({
+      ...prev,
+      holidays: (prev.holidays || []).filter((item) => {
+        if (typeof item !== 'string' && item.id && item.id === targetId) return false;
+        const obj = toHolidayObject(item);
+        const key = `${obj.date}|${obj.startTime || ''}|${obj.endTime || ''}|${obj.professionalId || ''}|${(obj.departments || ['all']).join(',')}|${obj.notes || ''}`;
+        return key !== targetKey;
+      })
+    }));
   };
 
   const compressDataUrlIfLarge = (value?: string, maxDim: number = 700, quality: number = 0.6): Promise<string | undefined> => {
@@ -1493,33 +1575,12 @@ export default function Admin({ settings, setSettings, setIsAdmin }: {
         seoHistory: seoHistory || [],
         migrated: true,
       }));
-      let mergedHolidays: (string | Holiday)[] | null = null;
-      try {
-        const [bloqueiosSnap, geralSnap] = await Promise.all([
-          getDoc(doc(db, 'configuracoes', 'bloqueios')),
-          getDoc(doc(db, 'configuracoes', 'geral')),
-        ]);
-        const existingBloqueios = bloqueiosSnap.exists() ? (bloqueiosSnap.data()?.holidays || []) : [];
-        const existingGeral = geralSnap.exists() ? (geralSnap.data()?.holidays || []) : [];
-        mergedHolidays = mergeUniqueHolidaysList(existingGeral, existingBloqueios, holidays || []);
-      } catch (fetchErr) {
-        console.warn('Could not merge holidays during saveSettings, skipping bloqueios overwrite:', fetchErr);
-      }
-
-      const writePromises: Promise<any>[] = [
+      await Promise.all([
         setDoc(doc(db, 'configuracoes', 'midia'), cleanMidia),
         setDoc(doc(db, 'configuracoes', 'fundo'), cleanFundo),
         setDoc(doc(db, 'configuracoes', 'pagamentos'), cleanPagamentos),
         setDoc(doc(db, 'configuracoes', 'seo'), cleanSeo),
-      ];
-      if (mergedHolidays !== null) {
-        const cleanHolidays = JSON.parse(JSON.stringify(mergedHolidays));
-        writePromises.push(
-          setDoc(doc(db, 'configuracoes', 'bloqueios'), { holidays: cleanHolidays, migrated: true })
-        );
-      }
-
-      await Promise.all(writePromises);
+      ]);
 
       await setDoc(doc(db, 'configuracoes', 'geral'), cleanCore);
       toast.success('Settings saved successfully!');
@@ -3797,24 +3858,9 @@ Can we confirm your visit? ✨`;
         )}
         {activeTab === 'holidays' && (
           <div className="max-w-3xl space-y-8">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div>
-                <h2 className="text-3xl font-serif font-bold">Holidays and Closures</h2>
-                <p className="text-sm opacity-60">Showing active blocks from Nov 2026 onwards ({(settings.holidays || []).length} active).</p>
-              </div>
-              <button
-                onClick={async () => {
-                  try {
-                    await saveHolidaysToFirestore(settings.holidays || [], false);
-                    toast.success('Old expired blocks (before Nov 2026) cleaned from Firebase!');
-                  } catch (err: any) {
-                    toast.error(`Error cleaning old blocks: ${err?.message || 'Check connection'}`);
-                  }
-                }}
-                className="px-4 py-2 rounded-xl text-xs font-bold border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 transition-colors shrink-0"
-              >
-                Clean Pre-Nov 2026 in Firebase
-              </button>
+            <div>
+              <h2 className="text-3xl font-serif font-bold">Holidays and Closures</h2>
+              <p className="text-sm opacity-60">Specific dates when specific departments or the entire salon will be closed (active from current month onwards).</p>
             </div>
             
             <div className="glass p-6 rounded-2xl space-y-4">
@@ -3875,8 +3921,7 @@ Can we confirm your visit? ✨`;
                       return;
                     }
                     const hObj: Holiday = { date: newHolidayDate, departments: newHolidayDepts };
-                    const currentHolidays = settings.holidays || [];
-                    await saveHolidaysToFirestore([...currentHolidays, hObj]);
+                    await addHolidayBlock(hObj);
                     
                     setNewHolidayDate('');
                     setNewHolidayDepts(['all']);
@@ -3955,8 +4000,7 @@ Can we confirm your visit? ✨`;
                             : 'Are you sure you want to permanently delete this closure/holiday?',
                           onConfirm: async () => {
                             try {
-                              const newHolidays = settings.holidays?.filter((_, i) => i !== idx) || [];
-                              await saveHolidaysToFirestore(newHolidays, true);
+                              await deleteHolidayBlock(h);
                               
                               setConfirmModal(prev => ({ ...prev, isOpen: false }));
                               toast.success(settings.language === 'pt' ? 'Bloqueio removido e salvo com sucesso!' : 'Closure removed and saved successfully!');
@@ -8637,18 +8681,7 @@ Can we confirm your visit? ✨`;
                         message: msg,
                         onConfirm: async () => {
                           try {
-                            const currentHolidays = settings.holidays || [];
-                            const newHolidays = currentHolidays.filter((h: any) => {
-                              if (typeof h === 'string') return true;
-                              const isMatch = h.date === selectedBlockDetail.originalBlock.date &&
-                                              h.startTime === selectedBlockDetail.originalBlock.startTime &&
-                                              h.endTime === selectedBlockDetail.originalBlock.endTime &&
-                                              (h.notes || '') === (selectedBlockDetail.originalBlock.notes || '') &&
-                                              h.professionalId === selectedBlockDetail.originalBlock.professionalId;
-                              return !isMatch;
-                            });
-
-                            await saveHolidaysToFirestore(newHolidays, true);
+                            await deleteHolidayBlock(selectedBlockDetail.originalBlock);
                             toast.success(settings.language === 'pt' ? 'Bloqueio removido com sucesso!' : 'Block removed successfully!');
                             setSelectedBlockDetail(null);
                             setConfirmModal(prev => ({ ...prev, isOpen: false }));
@@ -8815,8 +8848,7 @@ Can we confirm your visit? ✨`;
                     }
 
                     try {
-                      const currentHolidays = settings.holidays || [];
-                      await saveHolidaysToFirestore([...currentHolidays, hObj]);
+                      await addHolidayBlock(hObj);
                       toast.success('Period blocked successfully!');
                       setIsBlockingModalOpen(false);
                     } catch (err: any) {
